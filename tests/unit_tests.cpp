@@ -1,0 +1,631 @@
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "prp/cli/options.h"
+#include "prp/core/capture_item.h"
+#include "prp/core/item_queue.h"
+#include "prp/json/json_writer.h"
+#include "prp/net/framer.h"
+#include "prp/proto/schema.h"
+#include "prp/record/format.h"
+#include "prp/record/reader.h"
+#include "prp/record/recorder.h"
+#include "prp/util/base64.h"
+#include "prp/util/bytes.h"
+#include "prp/util/crc32c.h"
+#include "prp/util/fs.h"
+#include "prp/util/sha256.h"
+#include "prp/util/text.h"
+
+namespace {
+
+int g_failures = 0;
+
+#define CHECK(cond)                                                                  \
+  do {                                                                               \
+    if (!(cond)) {                                                                   \
+      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);           \
+      ++g_failures;                                                                  \
+    }                                                                                \
+  } while (0)
+
+#define CHECK_EQ(a, b)                                                               \
+  do {                                                                               \
+    const auto va = (a);                                                             \
+    const auto vb = (b);                                                             \
+    if (!(va == vb)) {                                                               \
+      std::fprintf(stderr, "FAIL %s:%d: %s != %s\n", __FILE__, __LINE__, #a, #b);    \
+      ++g_failures;                                                                  \
+    }                                                                                \
+  } while (0)
+
+std::filesystem::path make_temp_dir(const char* name) {
+  const auto dir = std::filesystem::temp_directory_path() /
+                   (std::string("prp-test-") + name + "-" + prp::random_hex(6));
+  std::string err;
+  CHECK(prp::ensure_directory(dir, err));
+  return dir;
+}
+
+void test_crc32c() {
+  const char* text = "123456789";
+  CHECK_EQ(prp::crc32c(text, 9), 0xE3069283u);
+  // Streaming update must produce the same result.
+  const uint32_t a = prp::crc32c_extend(0, text, 4);
+  CHECK_EQ(prp::crc32c_extend(a, text + 4, 5), 0xE3069283u);
+}
+
+void test_sha256() {
+  CHECK_EQ(prp::Sha256::hex_of("abc"), std::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+  CHECK_EQ(prp::Sha256::hex_of(""), std::string("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+}
+
+void test_base64() {
+  CHECK_EQ(prp::base64_encode("hello"), std::string("aGVsbG8="));
+  CHECK_EQ(prp::base64_encode(""), std::string(""));
+  std::vector<uint8_t> out;
+  CHECK(prp::base64_decode("aGVsbG8=", out));
+  CHECK_EQ(std::string(out.begin(), out.end()), std::string("hello"));
+  for (size_t n = 0; n < 40; ++n) {
+    std::string data(n, '\0');
+    for (size_t i = 0; i < n; ++i) data[i] = static_cast<char>((i * 37 + n) & 0xFF);
+    std::vector<uint8_t> back;
+    CHECK(prp::base64_decode(prp::base64_encode(data), back));
+    CHECK_EQ(std::string(back.begin(), back.end()), data);
+  }
+}
+
+void test_parsers() {
+  uint64_t size = 0;
+  CHECK(prp::parse_size("256MiB", size));
+  CHECK_EQ(size, 256ull * 1024 * 1024);
+  CHECK(prp::parse_size("1024", size));
+  CHECK_EQ(size, 1024ull);
+  CHECK(prp::parse_size("2G", size));
+  CHECK_EQ(size, 2ull * 1024 * 1024 * 1024);
+  CHECK(!prp::parse_size("abc", size));
+
+  std::chrono::milliseconds duration{0};
+  CHECK(prp::parse_duration("1500ms", duration));
+  CHECK_EQ(duration.count(), 1500ll);
+  CHECK(prp::parse_duration("2s", duration));
+  CHECK_EQ(duration.count(), 2000ll);
+  CHECK(prp::parse_duration("5m", duration));
+  CHECK_EQ(duration.count(), 300000ll);
+  CHECK(!prp::parse_duration("5x", duration));
+}
+
+void test_item_queue() {
+  auto payload = [](size_t n) {
+    return prp::make_data(1, prp::Direction::In, 0, std::vector<uint8_t>(n, 0x7F));
+  };
+  const size_t small_cost = payload(64)->accounted_bytes();
+  const size_t big_cost = payload(256)->accounted_bytes();
+
+  // Drop and Disconnect never block and account each discarded item.
+  for (const auto policy : {prp::OverflowPolicy::Drop, prp::OverflowPolicy::Disconnect}) {
+    prp::BoundedItemQueue queue(small_cost, policy);
+    CHECK(queue.push(payload(64)) == prp::PushResult::Ok);
+    const prp::PushResult expected =
+        policy == prp::OverflowPolicy::Drop ? prp::PushResult::Dropped : prp::PushResult::Overflow;
+    CHECK(queue.push(payload(64)) == expected);
+    CHECK_EQ(queue.buffered_items(), size_t{1});
+    CHECK_EQ(queue.stats().dropped_items, uint64_t{1});
+    CHECK_EQ(queue.stats().dropped_bytes, static_cast<uint64_t>(small_cost));
+    // An item larger than the queue is rejected as well.
+    CHECK(queue.push(payload(256)) == expected);
+    auto first = queue.pop();
+    CHECK(first != nullptr);
+    queue.close();
+    CHECK(queue.pop() == nullptr);
+  }
+
+  // Block waits until the consumer makes room.
+  {
+    prp::BoundedItemQueue queue(small_cost, prp::OverflowPolicy::Block);
+    CHECK(queue.push(payload(64)) == prp::PushResult::Ok);
+    std::atomic<bool> pushed{false};
+    std::thread producer([&] {
+      CHECK(queue.push(payload(64)) == prp::PushResult::Ok);
+      pushed.store(true);
+    });
+    auto first = queue.pop();
+    CHECK(first != nullptr);
+    producer.join();
+    CHECK(pushed.load());
+    auto second = queue.pop();
+    CHECK(second != nullptr);
+    queue.close();
+  }
+
+  // Block admits an item larger than the whole queue instead of deadlocking.
+  {
+    CHECK(big_cost > small_cost);
+    prp::BoundedItemQueue queue(small_cost, prp::OverflowPolicy::Block);
+    CHECK(queue.push(payload(256)) == prp::PushResult::Ok);
+    CHECK_EQ(queue.buffered_bytes(), big_cost);
+    auto first = queue.pop();
+    CHECK(first != nullptr);
+    queue.close();
+  }
+
+  // Closing the queue releases a blocked producer.
+  {
+    prp::BoundedItemQueue queue(small_cost, prp::OverflowPolicy::Block);
+    CHECK(queue.push(payload(64)) == prp::PushResult::Ok);
+    std::atomic<int> result{0};
+    std::thread producer([&] { result.store(static_cast<int>(queue.push(payload(64)))); });
+    queue.close();
+    producer.join();
+    CHECK_EQ(result.load(), static_cast<int>(prp::PushResult::Closed));
+    auto first = queue.pop();
+    CHECK(first != nullptr);
+    CHECK(queue.pop() == nullptr);
+  }
+}
+
+void test_filter_options() {
+  auto parse = [](std::vector<std::string> args, prp::Options& out, std::string& err) {
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (std::string& arg : args) argv.push_back(arg.data());
+    return prp::parse_options(static_cast<int>(argv.size()), argv.data(), out, err);
+  };
+
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                 "--message-type", "demo.A", "--filter", "demo.A, demo.B", "--filter", "demo.C,demo.A"},
+                options, err));
+    CHECK_EQ(options.type_filter.size(), size_t{3});
+    CHECK_EQ(options.type_filter[0], std::string("demo.A"));
+    CHECK_EQ(options.type_filter[1], std::string("demo.B"));
+    CHECK_EQ(options.type_filter[2], std::string("demo.C"));
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--filter", "demo.A"}, options, err));
+    CHECK(err.find("--filter requires --message-type") != std::string::npos);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--message-type", "demo.A",
+                  "--filter", "demo.A,,demo.B"},
+                 options, err));
+    CHECK(err.find("empty message type") != std::string::npos);
+  }
+}
+
+void test_chunk_and_json_options() {
+  auto parse = [](std::vector<std::string> args, prp::Options& out, std::string& err) {
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (std::string& arg : args) argv.push_back(arg.data());
+    return prp::parse_options(static_cast<int>(argv.size()), argv.data(), out, err);
+  };
+
+  {
+    // Defaults: one-minute chunks, no size cap, default JSON file name.
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "record", "--out", "/tmp/x"}, options, err));
+    CHECK_EQ(options.rotate_interval.count(), int64_t{60 * 1000});
+    CHECK_EQ(options.rotate_bytes, uint64_t{0});
+    CHECK_EQ(options.json_file.string(), std::string());
+    CHECK(!options.json_enabled);
+  }
+  {
+    // Chunk aliases and a custom JSON data file.
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                 "--message-type", "demo.A", "--json-file", "custom.jsonl",
+                 "--chunk-interval", "30s", "--chunk-size", "4KiB"},
+                options, err));
+    CHECK(options.json_enabled);
+    CHECK_EQ(options.json_file.string(), std::string("custom.jsonl"));
+    CHECK_EQ(options.rotate_interval.count(), int64_t{30 * 1000});
+    CHECK_EQ(options.rotate_bytes, uint64_t{4096});
+  }
+  {
+    // Legacy rotate names remain supported.
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "record", "--out", "/tmp/x", "--rotate-interval", "90s",
+                 "--rotate-size", "2MiB"},
+                options, err));
+    CHECK_EQ(options.rotate_interval.count(), int64_t{90 * 1000});
+    CHECK_EQ(options.rotate_bytes, uint64_t{2 * 1024 * 1024});
+  }
+  {
+    // A JSON file implies JSON output, which still requires a schema.
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--json-file", "x.jsonl"},
+                 options, err));
+    CHECK(err.find("--json requires --proto") != std::string::npos);
+  }
+}
+
+void test_config_file() {
+  auto parse = [](std::vector<std::string> args, prp::Options& out, std::string& err) {
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (std::string& arg : args) argv.push_back(arg.data());
+    return prp::parse_options(static_cast<int>(argv.size()), argv.data(), out, err);
+  };
+
+  const auto dir = make_temp_dir("config");
+  const auto config = dir / "rec.ini";
+  std::string err;
+  const std::string ini =
+      "# example config\n"
+      "[record]\n"
+      "proto = sample.proto\n"
+      "proto_path = /tmp/inc1\n"
+      "proto-path = /tmp/inc2\n"
+      "message_type = demo.Config\n"
+      "filter = demo.A, demo.B\n"
+      "json = true\n"
+      "json_file = custom.jsonl\n"
+      "chunk_interval = 45s\n"
+      "chunk_size = 8KiB\n"
+      "flat = true\n"
+      "\n"
+      "[extra]\n"
+      "log_level = debug\n";
+  CHECK(prp::write_file_atomic(config, ini, err));
+
+  {
+    prp::Options o;
+    CHECK(parse({"protorecprep", "record", "--config", config.string(), "--out", "/tmp/x"}, o, err));
+    CHECK_EQ(o.proto_file.string(), std::string("sample.proto"));
+    CHECK_EQ(o.proto_paths.size(), size_t{2});
+    CHECK_EQ(o.message_type, std::string("demo.Config"));
+    CHECK_EQ(o.type_filter.size(), size_t{2});
+    CHECK(o.json_enabled);
+    CHECK_EQ(o.json_file.string(), std::string("custom.jsonl"));
+    CHECK_EQ(o.rotate_interval.count(), int64_t{45 * 1000});
+    CHECK_EQ(o.rotate_bytes, uint64_t{8192});
+    CHECK(o.flat_output);
+    CHECK(o.log_level == prp::LogLevel::Debug);
+  }
+  {
+    // Explicit CLI values override config values.
+    prp::Options o;
+    CHECK(parse({"protorecprep", "record", "--config=" + config.string(), "--out", "/tmp/x",
+                 "--chunk-interval", "10s", "--message-type", "demo.Cli"},
+                o, err));
+    CHECK_EQ(o.rotate_interval.count(), int64_t{10 * 1000});
+    CHECK_EQ(o.message_type, std::string("demo.Cli"));
+  }
+  {
+    const auto off = dir / "off.ini";
+    CHECK(prp::write_file_atomic(off, "flat = false\njson = off\n", err));
+    prp::Options o;
+    CHECK(parse({"protorecprep", "record", "--config", off.string(), "--out", "/tmp/x"}, o, err));
+    CHECK(!o.flat_output);
+    CHECK(!o.json_enabled);
+  }
+  {
+    const auto bad = dir / "bad.ini";
+    CHECK(prp::write_file_atomic(bad, "proto sample.proto\n", err));
+    prp::Options o;
+    CHECK(!parse({"protorecprep", "record", "--config", bad.string(), "--out", "/tmp/x"}, o, err));
+    CHECK(err.find("expected 'key = value'") != std::string::npos);
+  }
+  {
+    // Typed keys go through the normal option parser, so unknown names fail.
+    const auto unknown = dir / "unknown.ini";
+    CHECK(prp::write_file_atomic(unknown, "does_not_exist = 1\n", err));
+    prp::Options o;
+    CHECK(!parse({"protorecprep", "record", "--config", unknown.string(), "--out", "/tmp/x"}, o,
+                 err));
+    CHECK(err.find("unknown option") != std::string::npos);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+void test_framer() {
+  prp::FrameValidator validator(prp::rec::Framing::VarintLength, 4096);
+  std::string err;
+
+  std::string wire = prp::frame_message("abcdef") + prp::frame_message("");
+  // Feed in awkward chunks, including a split varint.
+  CHECK(validator.feed(reinterpret_cast<const uint8_t*>(wire.data()), 1, err));
+  CHECK(validator.feed(reinterpret_cast<const uint8_t*>(wire.data()) + 1, 2, err));
+  CHECK(validator.feed(reinterpret_cast<const uint8_t*>(wire.data()) + 3, wire.size() - 3, err));
+  CHECK_EQ(validator.frames(), 2ull);
+  CHECK(err.empty());
+
+  prp::FrameValidator too_big(prp::rec::Framing::VarintLength, 4);
+  std::string big = prp::frame_message("hello");
+  CHECK(!too_big.feed(reinterpret_cast<const uint8_t*>(big.data()), big.size(), err));
+  CHECK(!err.empty());
+
+  // Malformed: unterminated varint (>10 bytes).
+  prp::FrameValidator malformed(prp::rec::Framing::VarintLength, 1024);
+  const uint8_t bad[11] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+  err.clear();
+  CHECK(!malformed.feed(bad, sizeof(bad), err));
+
+  prp::FrameReader reader(4096);
+  const std::string w1 = prp::frame_message("one");
+  const std::string w2 = prp::frame_message("second");
+  std::string data = w1 + w2.substr(0, 2);
+  reader.append(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+  std::string_view frame;
+  CHECK(reader.next(frame, err) == prp::FrameReader::Result::Frame);
+  CHECK_EQ(std::string(frame), std::string("one"));
+  CHECK(reader.next(frame, err) == prp::FrameReader::Result::NeedMore);
+  reader.append(reinterpret_cast<const uint8_t*>(w2.data()) + 2, w2.size() - 2);
+  CHECK(reader.next(frame, err) == prp::FrameReader::Result::Frame);
+  CHECK_EQ(std::string(frame), std::string("second"));
+  CHECK(reader.next(frame, err) == prp::FrameReader::Result::NeedMore);
+}
+
+void test_file_header() {
+  prp::rec::FileHeader header;
+  header.framing = prp::rec::Framing::VarintLength;
+  header.start_wall_ns = 123456789;
+  header.session_uuid = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  header.proto_sha256 = prp::Sha256::digest("schema");
+  header.descriptor_set = "descriptor-bytes";
+
+  const auto encoded = prp::rec::encode_file_header(header);
+  prp::rec::FileHeader decoded;
+  size_t consumed = 0;
+  std::string err;
+  CHECK(prp::rec::decode_file_header(encoded.data(), encoded.size(), decoded, consumed, err));
+  CHECK_EQ(consumed, encoded.size());
+  CHECK_EQ(decoded.framing, prp::rec::Framing::VarintLength);
+  CHECK_EQ(decoded.start_wall_ns, 123456789);
+  CHECK(decoded.session_uuid == header.session_uuid);
+  CHECK(decoded.proto_sha256 == header.proto_sha256);
+  CHECK_EQ(decoded.descriptor_set, std::string("descriptor-bytes"));
+
+  auto corrupted = encoded;
+  corrupted[corrupted.size() - 1] ^= 0xFF;
+  prp::rec::FileHeader bad;
+  CHECK(!prp::rec::decode_file_header(corrupted.data(), corrupted.size(), bad, consumed, err));
+}
+
+void test_recorder_roundtrip() {
+  const auto dir = make_temp_dir("recorder");
+  prp::RecorderConfig config;
+  config.out_dir = dir;
+  config.framing = prp::rec::Framing::VarintLength;
+  config.session_id = prp::random_hex(16);
+  config.rotate_bytes = 4096;  // force many segments
+  config.fsync_interval = std::chrono::milliseconds(0);
+  config.write_batch_bytes = 1024;
+  config.proto_sha256 = prp::Sha256::digest("proto");
+
+  prp::Recorder recorder(config);
+  std::string err;
+  CHECK(recorder.start(err));
+
+  constexpr uint32_t kStream = 7;
+  uint64_t expected_bytes = 0;
+  recorder.submit(prp::make_stream_open(kStream, prp::now_wall_ns(), "127.0.0.1:1", "demo.TestRecord"));
+  for (int i = 0; i < 50; ++i) {
+    std::vector<uint8_t> payload(static_cast<size_t>(100 + i * 13));
+    for (size_t k = 0; k < payload.size(); ++k) payload[k] = static_cast<uint8_t>(k + i);
+    expected_bytes += payload.size();
+    recorder.submit(prp::make_data(kStream, prp::Direction::In, prp::now_wall_ns(), std::move(payload)));
+  }
+  recorder.submit(prp::make_stream_close(kStream, prp::CloseReason::PeerClosed, prp::now_wall_ns()));
+  recorder.stop();
+
+  const prp::RecorderStats stats = recorder.stats();
+  CHECK(!stats.failed);
+  CHECK_EQ(stats.data_bytes, expected_bytes);
+  CHECK(stats.segments > 1);
+
+  std::vector<prp::ScanStats> results;
+  CHECK(prp::recover_session_dir(dir, results, false, err));
+  CHECK_EQ(results.size(), stats.segments);
+  uint64_t data_bytes = 0;
+  uint64_t opens = 0;
+  for (const auto& scan : results) {
+    CHECK(scan.header_ok);
+    CHECK(!scan.truncated);
+    CHECK(scan.has_trailer);
+    CHECK(scan.trailer.clean);
+    data_bytes += scan.data_bytes;
+    opens += scan.open_records;
+  }
+  CHECK_EQ(data_bytes, expected_bytes);
+  CHECK(opens >= results.size());  // stream metadata re-emitted per segment
+
+  std::filesystem::remove_all(dir);
+}
+
+void test_truncation_recovery() {
+  const auto dir = make_temp_dir("recovery");
+  prp::RecorderConfig config;
+  config.out_dir = dir;
+  config.session_id = prp::random_hex(16);
+  config.rotate_bytes = 0;
+  config.fsync_interval = std::chrono::milliseconds(0);
+
+  prp::Recorder recorder(config);
+  std::string err;
+  CHECK(recorder.start(err));
+  recorder.submit(prp::make_data(1, prp::Direction::In, prp::now_wall_ns(), std::vector<uint8_t>(64, 0xAB)));
+  recorder.stop();
+
+  const auto file = dir / "capture-000001.pcr";
+  CHECK(std::filesystem::exists(file));
+  const uint64_t good_size = std::filesystem::file_size(file);
+  {
+    std::FILE* f = std::fopen(file.c_str(), "ab");
+    CHECK(f != nullptr);
+    const uint8_t junk[12] = {2, 0x40, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7};  // partial record
+    std::fwrite(junk, 1, sizeof(junk), f);
+    std::fclose(f);
+  }
+
+  prp::ScanStats damaged;
+  CHECK(prp::scan_capture_file(file, damaged, err));
+  CHECK(damaged.truncated);
+  CHECK_EQ(damaged.valid_end, good_size);
+
+  std::vector<prp::ScanStats> results;
+  CHECK(prp::recover_session_dir(dir, results, true, err));
+  CHECK_EQ(results.size(), 1u);
+  CHECK_EQ(std::filesystem::file_size(file), good_size);
+
+  prp::ScanStats repaired;
+  CHECK(prp::scan_capture_file(file, repaired, err));
+  CHECK(!repaired.truncated);
+  CHECK(repaired.has_trailer);
+
+  std::filesystem::remove_all(dir);
+}
+
+void test_schema(const char* proto_path) {
+  prp::Schema schema;
+  std::string err;
+  CHECK(schema.load(proto_path, {}, err));
+  CHECK(schema.loaded());
+  CHECK(schema.find_message("demo.TestRecord") != nullptr);
+  CHECK(schema.find_message("demo.Missing") == nullptr);
+
+  std::string descriptor_set;
+  CHECK(schema.build_descriptor_set(descriptor_set, err));
+  CHECK(!descriptor_set.empty());
+
+  const auto* descriptor = schema.find_message("demo.TestRecord");
+  CHECK(descriptor != nullptr);
+  google::protobuf::DynamicMessageFactory factory(schema.pool());
+  std::unique_ptr<google::protobuf::Message> message(factory.GetPrototype(descriptor)->New());
+  CHECK(prp::json_to_message("{\"seq\":42,\"name\":\"abc\",\"nested\":{\"kind\":\"x\"}}", *message, false, err));
+
+  std::string json;
+  CHECK(prp::message_to_json(*message, true, false, json, err));
+  CHECK(json.find("\"seq\":\"42\"") != std::string::npos || json.find("\"seq\":42") != std::string::npos);
+  CHECK(json.find("abc") != std::string::npos);
+
+  CHECK(!prp::json_to_message("{\"seq\":\"not-a-number\"}", *message, false, err));
+}
+
+void test_json_escape() {
+  CHECK_EQ(prp::json_escape("a\"b\\c\n\t"), std::string("a\\\"b\\\\c\\n\\t"));
+  CHECK_EQ(prp::json_escape(std::string("\x01", 1)), std::string("\\u0001"));
+  const std::string invalid("\xff", 1);
+  CHECK_EQ(prp::json_escape(invalid), std::string("\\ufffd"));
+}
+
+void test_json_writer(const char* proto_path) {
+  const auto dir = make_temp_dir("json");
+  prp::Schema schema;
+  std::string err;
+  CHECK(schema.load(proto_path, {}, err));
+
+  const auto* descriptor = schema.find_message("demo.TestRecord");
+  google::protobuf::DynamicMessageFactory factory(schema.pool());
+  std::unique_ptr<google::protobuf::Message> message(factory.GetPrototype(descriptor)->New());
+  CHECK(prp::json_to_message("{\"seq\":7,\"name\":\"json-test\"}", *message, false, err));
+  std::string serialized;
+  CHECK(message->SerializeToString(&serialized));
+
+  const std::string wire = prp::frame_message(serialized);
+
+  const auto* out_descriptor = schema.find_message("demo.Nested");
+  std::unique_ptr<google::protobuf::Message> out_message(
+      factory.GetPrototype(out_descriptor)->New());
+  CHECK(prp::json_to_message("{\"kind\":\"nested-out\",\"enabled\":true}", *out_message, false, err));
+  std::string out_serialized;
+  CHECK(out_message->SerializeToString(&out_serialized));
+  const std::string out_wire = prp::frame_message(out_serialized);
+
+  prp::JsonWriterConfig config;
+  config.output_path = dir / "events.jsonl";
+  config.schema = &schema;
+  config.default_type_name = "demo.TestRecord";
+  config.framing = prp::rec::Framing::VarintLength;
+  prp::JsonWriter writer(config);
+  CHECK(writer.start(err));
+
+  writer.submit(prp::make_stream_open(1, prp::now_wall_ns(), "peer:1", "demo.TestRecord"));
+  writer.submit(prp::make_data(1, prp::Direction::In, prp::now_wall_ns(),
+                               std::vector<uint8_t>(wire.begin(), wire.end())));
+  // Split a frame across chunks.
+  writer.submit(prp::make_data(1, prp::Direction::In, prp::now_wall_ns(),
+                               std::vector<uint8_t>(wire.begin(), wire.begin() + 1)));
+  writer.submit(prp::make_data(1, prp::Direction::In, prp::now_wall_ns(),
+                               std::vector<uint8_t>(wire.begin() + 1, wire.end())));
+  // Outbound messages may use a different message type than the inbound stream.
+  writer.submit(prp::make_data(1, prp::Direction::Out, prp::now_wall_ns(),
+                               std::vector<uint8_t>(out_wire.begin(), out_wire.end()),
+                               "demo.Nested"));
+  writer.submit(prp::make_stream_close(1, prp::CloseReason::PeerClosed, prp::now_wall_ns()));
+  writer.stop();
+
+  const auto stats = writer.stats();
+  CHECK(!stats.failed);
+  CHECK(stats.messages >= 3);
+  CHECK_EQ(stats.parse_errors, 0ull);
+
+  std::string content;
+  CHECK(prp::read_file(config.output_path, content, err));
+  CHECK(content.find("\"event\":\"stream_open\"") != std::string::npos);
+  CHECK(content.find("\"event\":\"stream_close\"") != std::string::npos);
+  CHECK(content.find("json-test") != std::string::npos);
+  CHECK(content.find("nested-out") != std::string::npos);
+  CHECK(content.find("\"dir\":\"out\"") != std::string::npos);
+  CHECK(content.find("\"type\":\"demo.Nested\"") != std::string::npos);
+  CHECK(content.find("\"messages\"") == std::string::npos);
+
+  std::filesystem::remove_all(dir);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    std::fprintf(stderr, "usage: prp_tests <sample.proto>\n");
+    return 2;
+  }
+  const char* proto = argv[1];
+  // Homebrew's protobuf/absl shared libraries crash inside DescriptorPool
+  // when the caller is ASan-instrumented, so sanitizer jobs run the
+  // protobuf-independent subset. (See tests/CMakeLists.txt.)
+  const char* skip_proto = std::getenv("PRP_SKIP_PROTO_TESTS");
+  const bool with_proto = !(skip_proto && *skip_proto != '\0' && std::string(skip_proto) != "0");
+
+  test_crc32c();
+  test_sha256();
+  test_base64();
+  test_parsers();
+  test_filter_options();
+  test_chunk_and_json_options();
+  test_config_file();
+  test_framer();
+  test_item_queue();
+  test_file_header();
+  test_recorder_roundtrip();
+  test_truncation_recovery();
+  test_json_escape();
+  if (with_proto) {
+    test_schema(proto);
+    test_json_writer(proto);
+  }
+
+  if (g_failures != 0) {
+    std::fprintf(stderr, "%d test(s) failed\n", g_failures);
+    return 1;
+  }
+  std::printf("all tests passed\n");
+  return 0;
+}

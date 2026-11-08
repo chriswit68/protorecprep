@@ -1,0 +1,29 @@
+Anforderungspapier für die Applikation protorecrep
+
+1. Einleitung
+Ziel dieser Anwendung ist die Aufzeichnung und Wiedergabe von Netzwerkdatenströmen, die Informationen im protobuf-Format beinhalten. 
+Sie soll unter Linux und Macos laufen und in c++ ab Version 17 programmiert werden.
+Die Konfiguration der Anwendung soll über CLI erfolgen. Optional kann die Konfiguration auch über eine Konfigurationsdatei erfolgen, die per CLI-Parameter übergeben wird. Das Format der Konfigurations-Datei soll .ini sein. 
+Die Konfiguration soll die Möglichkeit bieten, die .proto-Datei zu übergeben, die für die Aufzeichnung und Wiedergabe der Daten benötigt wird.
+Die Applikation kennt drei Modi, in der sie laufen kann:
+a) recording, die Anwendung startet einen Server, der die Client-Daten entgegennimmt und auf Platte abspeichert.
+b) replay, die Anwendung startet einen Client, der die Aufgezeichbneten binären protobuf-daten an einen anderen Server weiterleitet.
+c) passthroug, die Anwendung startet einen Server, der die Client-Daten entgegennimmt und auf Platte abspeichert und zusätlich die Daten an einen anderen Server weiterleitet.
+
+Für die Aufzeichnung und Wiedergabe der Daten kann die Anwendung auf die .proto-Datei zugreifen, die per Konfiguration übergeben wird.
+
+2. recording-Modus
+recording, die Anwendung startet einen Server, der die Client-Daten entgegennimmt und auf Platte abspeichert. Das Speichern erfolgt zum einen im binär-format, als auch optional im JSON-Format.
+Das Binär-Format dient einzig dazu die Daten im Replay-Mode an einen anderen Server weiterzuleiten. Das JSON-Format dient der Analyse und Debugging. Das JSON-Format soll die korrekten Message-Namen aus der .proto-Datei übernehmen.
+Zusätzlich soll es eine Option geben, bei der sowohl im JSON, als auch im Binär-Format nach ein oder mehreren bestimmten Nachrichten gefiltert werden kann. Die Filterung erfolgt über die Message-Namen aus der .proto-Datei.
+Das Zielverzeichnis, sowie Server-Port sind über CLI konfigurierbar.
+Das Abspeichern der Binärdaten soll in "chunks" erfolgen, die eine bestimmten Zeitraum abdecken. Die Größe der Chunks ist konfigurierbar. Das Abspeichern der JSON-Daten erfolgt in einer Datei, die ebenfalls konfigurierbar ist.
+Optional muss der Server in der Lage sein Protobuf-Nachrichten aus der .proto-Date zum Client zu senden. Der Zeitpunkt zum Senden der Nachricht muss konfigurierbar sein. Nachrichten müssen auch zyklichen in bestimmten Intervallen an 
+den Client gesendet werden können. Der Inhalt der Nachricht ist ebenfalls konfigurierbar, sofern die Proto-Message nicht leer ist..
+
+3. replay-Modus
+Die Anwendung startet einen Client, der die Aufgezeichbneten binären protobuf-daten an einen anderen Ziel-Server weiterleitet. Der Server ist über CLI-Parameter konfigurierbar
+
+3. passthrough.Modus
+Die Anwendung startet einen Server, der die Client-Daten entgegennimmt, auf Platte abspeichert und zusätlich die Daten an einen anderen Server weiterleitet, ohne dabei auf die abgespeicherten Daten zuzugreifen. 
+Das Abspeichern im JSON-Format ist optional.

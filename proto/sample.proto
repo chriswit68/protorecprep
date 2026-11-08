@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package demo;
+
+message TestRecord {
+  uint64 seq = 1;
+  string name = 2;
+  int64 value = 3;
+  repeated double samples = 4;
+  Nested nested = 5;
+}
+
+message Nested {
+  string kind = 1;
+  bool enabled = 2;
+}
+
+message EmptyMessage {}
