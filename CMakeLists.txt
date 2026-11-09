@@ -39,8 +39,10 @@ add_library(prp_core
   src/prp/json/json_writer.cpp
   src/prp/net/framer.cpp
   src/prp/net/server.cpp
+  src/prp/net/client.cpp
   src/prp/cli/options.cpp
   src/prp/app/record_app.cpp
+  src/prp/replay/replay_app.cpp
 )
 target_include_directories(prp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(prp_core PUBLIC

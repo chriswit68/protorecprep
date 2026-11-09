@@ -191,4 +191,37 @@ size_t data_payload_bytes(const uint8_t* payload, size_t len) {
   return len > kDataFixed ? len - kDataFixed : 0;
 }
 
+bool parse_stream_open(const uint8_t* payload, size_t len, StreamOpenInfo& out) {
+  constexpr size_t kFixed = 16;  // stream_id + ts + peer_len + type_len
+  if (payload == nullptr || len < kFixed) return false;
+  const uint16_t peer_len = get_u16le(payload + 12);
+  const uint16_t type_len = get_u16le(payload + 14);
+  if (kFixed + static_cast<size_t>(peer_len) + static_cast<size_t>(type_len) != len) return false;
+  out.stream_id = get_u32le(payload);
+  out.ts_ns = get_i64le(payload + 4);
+  out.peer.assign(reinterpret_cast<const char*>(payload + kFixed), peer_len);
+  out.type_name.assign(reinterpret_cast<const char*>(payload + kFixed + peer_len), type_len);
+  return true;
+}
+
+bool parse_data(const uint8_t* payload, size_t len, DataInfo& out) {
+  if (payload == nullptr || len < kDataFixed) return false;
+  const uint8_t dir = payload[4];
+  if (dir > static_cast<uint8_t>(Direction::Out)) return false;
+  out.stream_id = get_u32le(payload);
+  out.dir = static_cast<Direction>(dir);
+  out.ts_ns = get_i64le(payload + 8);
+  out.data = payload + kDataFixed;
+  out.size = len - kDataFixed;
+  return true;
+}
+
+bool parse_stream_close(const uint8_t* payload, size_t len, StreamCloseInfo& out) {
+  if (payload == nullptr || len < kDataFixed) return false;
+  out.stream_id = get_u32le(payload);
+  out.reason = static_cast<CloseReason>(payload[4]);
+  out.ts_ns = get_i64le(payload + 8);
+  return true;
+}
+
 }  // namespace prp::rec

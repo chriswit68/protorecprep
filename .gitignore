@@ -7,3 +7,5 @@ CMakeCache.txt
 *.pcr
 captures/
 recordings/
+__pycache__/
+*.pyc

@@ -24,8 +24,10 @@ struct SendOptions {
   uint64_t count = 0;  // 0 = unlimited
 };
 
+enum class ReplayDirection { In, Out, Both };
+
 struct Options {
-  std::string command;  // "record" or "inspect"
+  std::string command;  // "record", "replay" or "inspect"
 
   // Common
   LogLevel log_level = LogLevel::Info;
@@ -61,10 +63,22 @@ struct Options {
   std::chrono::milliseconds idle_timeout{0};
   SendOptions send;
 
-  // inspect
-  fs::path inspect_file;
-  fs::path inspect_dir;
-  bool truncate_damaged = false;
+  // replay
+  std::string target_host;
+  uint16_t target_port = 0;
+  double replay_speed = 1.0;  // 1.0 = realtime, 0 = as fast as possible
+  ReplayDirection replay_direction = ReplayDirection::In;
+  bool replay_reconnect = false;
+  uint64_t connect_retries = 5;
+  std::chrono::milliseconds connect_timeout{5000};
+  std::chrono::milliseconds retry_interval{1000};
+  std::chrono::milliseconds max_gap{0};
+  bool strict = false;
+
+  // inspect / replay
+  fs::path input_file;  // --rec
+  fs::path input_dir;   // --dir
+  bool truncate_damaged = false;  // inspect --truncate
 
   bool help = false;
   bool version = false;

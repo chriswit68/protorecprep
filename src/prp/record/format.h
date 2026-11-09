@@ -66,4 +66,30 @@ struct TrailerInfo {
 bool parse_trailer(const uint8_t* payload, size_t len, TrailerInfo& out);
 size_t data_payload_bytes(const uint8_t* payload, size_t len);
 
+// Decoders for replay. Each returns false when the payload is malformed (for
+// example truncated or carrying an invalid direction byte).
+struct StreamOpenInfo {
+  uint32_t stream_id = 0;
+  int64_t ts_ns = 0;
+  std::string peer;
+  std::string type_name;
+};
+bool parse_stream_open(const uint8_t* payload, size_t len, StreamOpenInfo& out);
+
+struct DataInfo {
+  uint32_t stream_id = 0;
+  Direction dir = Direction::In;
+  int64_t ts_ns = 0;
+  const uint8_t* data = nullptr;
+  size_t size = 0;
+};
+bool parse_data(const uint8_t* payload, size_t len, DataInfo& out);
+
+struct StreamCloseInfo {
+  uint32_t stream_id = 0;
+  CloseReason reason = CloseReason::PeerClosed;
+  int64_t ts_ns = 0;
+};
+bool parse_stream_close(const uint8_t* payload, size_t len, StreamCloseInfo& out);
+
 }  // namespace prp::rec

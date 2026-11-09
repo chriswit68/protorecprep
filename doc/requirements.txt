@@ -22,7 +22,8 @@ Optional muss der Server in der Lage sein Protobuf-Nachrichten aus der .proto-Da
 den Client gesendet werden können. Der Inhalt der Nachricht ist ebenfalls konfigurierbar, sofern die Proto-Message nicht leer ist..
 
 3. replay-Modus
-Die Anwendung startet einen Client, der die Aufgezeichbneten binären protobuf-daten an einen anderen Ziel-Server weiterleitet. Der Server ist über CLI-Parameter konfigurierbar
+Die Anwendung startet einen Client, der die Aufgezeichbneten binären protobuf-daten an einen anderen Ziel-Server weiterleitet. Der Server ist über CLI-Parameter und ini-Datei konfigurierbar.
+Der replay soll per Default die Binär-Daten in echtzeit erfolgen. Optoinal kann die Wiedergabe der Daten auch in einer höheren Geschwindigkeit erfolgen. Die Geschwindigkeit ist konfigurierbar.
 
 3. passthrough.Modus
 Die Anwendung startet einen Server, der die Client-Daten entgegennimmt, auf Platte abspeichert und zusätlich die Daten an einen anderen Server weiterleitet, ohne dabei auf die abgespeicherten Daten zuzugreifen. 

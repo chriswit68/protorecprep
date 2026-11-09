@@ -339,21 +339,21 @@ int run_record(const Options& options, std::string& err) {
 
 int run_inspect(const Options& options, std::string& err) {
   std::vector<ScanStats> results;
-  if (!options.inspect_file.empty()) {
+  if (!options.input_file.empty()) {
     ScanStats stats;
-    if (!scan_capture_file(options.inspect_file, stats, err)) return 2;
-    stats.path = options.inspect_file;
+    if (!scan_capture_file(options.input_file, stats, err)) return 2;
+    stats.path = options.input_file;
     if (stats.truncated && options.truncate_damaged) {
-      if (::truncate(options.inspect_file.c_str(), static_cast<off_t>(stats.valid_end)) != 0) {
+      if (::truncate(options.input_file.c_str(), static_cast<off_t>(stats.valid_end)) != 0) {
         err = "truncate failed: " + std::string(std::strerror(errno));
         return 2;
       }
-      log_printf(LogLevel::Info, "truncated %s at offset %llu", options.inspect_file.c_str(),
+      log_printf(LogLevel::Info, "truncated %s at offset %llu", options.input_file.c_str(),
                  static_cast<unsigned long long>(stats.valid_end));
     }
     results.push_back(std::move(stats));
   } else {
-    if (!recover_session_dir(options.inspect_dir, results, options.truncate_damaged, err)) return 2;
+    if (!recover_session_dir(options.input_dir, results, options.truncate_damaged, err)) return 2;
   }
 
   bool damaged = false;

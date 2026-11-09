@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -38,5 +39,59 @@ bool scan_capture_file(const fs::path& path, ScanStats& stats, std::string& err)
 // at the last valid record boundary.
 bool recover_session_dir(const fs::path& dir, std::vector<ScanStats>& results, bool truncate_damaged,
                          std::string& err);
+
+// Lists capture-*.pcr files in ascending (chronological) order.
+bool list_capture_files(const fs::path& dir, std::vector<fs::path>& files, std::string& err);
+
+// Reads and validates only the file header (magic, version, descriptor, CRC).
+bool read_capture_header(const fs::path& path, rec::FileHeader& header, size_t& header_size,
+                         std::string& err);
+
+enum class ReadStatus {
+  Record,
+  Eof,
+  Damaged,
+  Error,
+};
+
+struct CaptureRecord {
+  rec::RecordType type = rec::RecordType::Data;
+  uint32_t stream_id = 0;
+  Direction dir = Direction::In;
+  int64_t ts_ns = 0;
+  uint8_t close_reason = 0;
+  std::string peer;
+  std::string type_name;
+  std::vector<uint8_t> data;
+};
+
+// Sequential, CRC-validating reader for a single capture file. Damaged tails
+// are reported once via ReadStatus::Damaged; the following call returns Eof so
+// the caller can continue with the next chunk.
+class CaptureReader {
+ public:
+  CaptureReader() = default;
+  ~CaptureReader();
+
+  CaptureReader(const CaptureReader&) = delete;
+  CaptureReader& operator=(const CaptureReader&) = delete;
+
+  bool open(const fs::path& path, std::string& err);
+  ReadStatus next(CaptureRecord& out, std::string& detail);
+  void close();
+
+  bool is_open() const { return file_ != nullptr; }
+  const rec::FileHeader& header() const { return header_; }
+  const fs::path& path() const { return path_; }
+  uint64_t records_read() const { return records_read_; }
+
+ private:
+  FILE* file_ = nullptr;
+  fs::path path_;
+  rec::FileHeader header_;
+  std::vector<uint8_t> payload_;
+  bool damaged_ = false;
+  uint64_t records_read_ = 0;
+};
 
 }  // namespace prp

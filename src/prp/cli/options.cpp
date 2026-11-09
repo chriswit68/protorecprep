@@ -1,8 +1,11 @@
 #include "prp/cli/options.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <thread>
 
@@ -52,7 +55,7 @@ bool parse_bool_value(std::string_view text, bool& out) {
 bool is_boolean_key(const std::string& key) {
   return key == "flat" || key == "durable" || key == "json" ||
          key == "json-print-defaults" || key == "json-preserve-names" || key == "truncate" ||
-         key == "quiet" || key == "verbose";
+         key == "reconnect" || key == "strict" || key == "quiet" || key == "verbose";
 }
 
 // Reads a .ini file into CLI-style arguments. Keys are long option names
@@ -200,6 +203,65 @@ void set_defaults_for_record(Options& o) {
   }
 }
 
+bool parse_target(const std::string& text, std::string& host, uint16_t& port, std::string& err) {
+  std::string h;
+  std::string p;
+  if (!text.empty() && text.front() == '[') {
+    const auto close = text.find(']');
+    if (close == std::string::npos || close + 1 >= text.size() || text[close + 1] != ':') {
+      err = "invalid --target value (expected [host]:port): " + text;
+      return false;
+    }
+    h = text.substr(1, close - 1);
+    p = text.substr(close + 2);
+  } else {
+    const auto colon = text.rfind(':');
+    if (colon == std::string::npos) {
+      err = "invalid --target value (expected host:port): " + text;
+      return false;
+    }
+    h = text.substr(0, colon);
+    p = text.substr(colon + 1);
+  }
+  uint64_t port_value = 0;
+  if (h.empty() || !parse_u64(p, port_value) || port_value == 0 || port_value > 65535) {
+    err = "invalid --target value (expected host:port): " + text;
+    return false;
+  }
+  host = std::move(h);
+  port = static_cast<uint16_t>(port_value);
+  return true;
+}
+
+bool parse_speed(const std::string& text, double& out) {
+  std::string value = text;
+  if (!value.empty() && (value.back() == 'x' || value.back() == 'X')) value.pop_back();
+  if (value.empty()) return false;
+  errno = 0;
+  char* end = nullptr;
+  const double parsed = std::strtod(value.c_str(), &end);
+  if (errno != 0 || end != value.c_str() + value.size() || !std::isfinite(parsed) || parsed < 0.0) {
+    return false;
+  }
+  out = parsed;
+  return true;
+}
+
+bool parse_replay_direction(const std::string& text, ReplayDirection& out) {
+  if (text == "in") out = ReplayDirection::In;
+  else if (text == "out") out = ReplayDirection::Out;
+  else if (text == "both") out = ReplayDirection::Both;
+  else return false;
+  return true;
+}
+
+void set_defaults_for_replay(Options& o) {
+  if (o.io_threads == 0) {
+    const unsigned hw = std::thread::hardware_concurrency();
+    o.io_threads = std::max(1u, std::min(4u, hw == 0 ? 2u : hw));
+  }
+}
+
 }  // namespace
 
 bool parse_size(std::string_view raw, uint64_t& out) {
@@ -262,8 +324,8 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
     out.version = true;
     return true;
   }
-  if (first != "record" && first != "inspect") {
-    err = "unknown command '" + first + "' (expected 'record' or 'inspect')";
+  if (first != "record" && first != "inspect" && first != "replay") {
+    err = "unknown command '" + first + "' (expected 'record', 'replay' or 'inspect')";
     return false;
   }
   out.command = first;
@@ -472,11 +534,41 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
     } else if (key == "--rec") {
       std::string text;
       if (!need_value(text)) return false;
-      out.inspect_file = text;
+      out.input_file = text;
     } else if (key == "--dir") {
       std::string text;
       if (!need_value(text)) return false;
-      out.inspect_dir = text;
+      out.input_dir = text;
+    } else if (key == "--target") {
+      std::string text;
+      if (!need_value(text)) return false;
+      if (!parse_target(text, out.target_host, out.target_port, err)) return false;
+    } else if (key == "--speed") {
+      std::string text;
+      if (!need_value(text)) return false;
+      if (!parse_speed(text, out.replay_speed)) {
+        err = "invalid --speed value (expected a non-negative factor): " + text;
+        return false;
+      }
+    } else if (key == "--direction") {
+      std::string text;
+      if (!need_value(text)) return false;
+      if (!parse_replay_direction(text, out.replay_direction)) {
+        err = "invalid --direction value (in|out|both): " + text;
+        return false;
+      }
+    } else if (key == "--reconnect") {
+      out.replay_reconnect = true;
+    } else if (key == "--connect-timeout") {
+      if (!need_duration(out.connect_timeout)) return false;
+    } else if (key == "--connect-retries") {
+      if (!need_u64(out.connect_retries)) return false;
+    } else if (key == "--retry-interval") {
+      if (!need_duration(out.retry_interval)) return false;
+    } else if (key == "--max-gap") {
+      if (!need_duration(out.max_gap)) return false;
+    } else if (key == "--strict") {
+      out.strict = true;
     } else if (key == "--truncate") {
       out.truncate_damaged = true;
     } else if (key == "--quiet") {
@@ -545,12 +637,48 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       return false;
     }
     set_defaults_for_record(out);
+  } else if (out.command == "replay") {
+    if (out.input_file.empty() && out.input_dir.empty()) {
+      err = "replay requires --rec <file.pcr> or --dir <session-dir>";
+      return false;
+    }
+    if (!out.input_file.empty() && !out.input_dir.empty()) {
+      err = "replay accepts either --rec or --dir, not both";
+      return false;
+    }
+    if (out.target_host.empty() || out.target_port == 0) {
+      err = "replay requires --target <host:port>";
+      return false;
+    }
+    if (!out.proto_paths.empty() && out.proto_file.empty()) {
+      err = "--proto-path requires --proto";
+      return false;
+    }
+    if (out.connect_retries == 0) {
+      err = "--connect-retries must be > 0";
+      return false;
+    }
+    if (out.connect_timeout.count() <= 0) {
+      err = "--connect-timeout must be > 0";
+      return false;
+    }
+    if (out.retry_interval.count() < 0 || out.max_gap.count() < 0) {
+      err = "--retry-interval and --max-gap must not be negative";
+      return false;
+    }
+    // --truncate is an inspect-only repair flag; silently accepting it during
+    // replay would be misleading.
+    if (out.truncate_damaged) {
+      err = "replay does not modify captures; --truncate is only valid for inspect";
+      return false;
+    }
+    set_defaults_for_replay(out);
   } else {
-    if (out.inspect_file.empty() && out.inspect_dir.empty()) {
+    if (out.input_file.empty() && out.input_dir.empty()) {
       err = "inspect requires --rec <file> or --dir <session-dir>";
       return false;
     }
-    if (!out.inspect_file.empty() && !out.inspect_dir.empty()) {
+    if (!out.input_file.empty() && !out.input_dir.empty()) {
       err = "inspect accepts either --rec or --dir, not both";
       return false;
     }
@@ -564,6 +692,8 @@ void print_help() {
       "\n"
       "USAGE\n"
       "  protorecprep record [options]\n"
+      "  protorecprep replay --rec <capture.pcr> --target <host:port> [options]\n"
+      "  protorecprep replay --dir <session-dir> --target <host:port> [options]\n"
       "  protorecprep inspect --rec <capture.pcr> [--truncate]\n"
       "  protorecprep inspect --dir <session-dir> [--truncate]\n"
       "\n"
@@ -599,6 +729,24 @@ void print_help() {
       "  --send-once-after <dur>     Send once after connect\n"
       "  --send-every <dur>          Send periodically\n"
       "  --send-count <n>            Total sends per connection (0=unlimited)\n"
+      "\n"
+      "REPLAY OPTIONS\n"
+      "  --rec <file.pcr>            Replay a single capture file\n"
+      "  --dir <session-dir>         Replay all capture-*.pcr chunks in order\n"
+      "  --target <host:port>        Destination server (required)\n"
+      "  --speed <factor>            Playback speed: 1.0 realtime, 0=max (default 1.0)\n"
+      "  --direction <in|out|both>   Recorded direction to send (default in)\n"
+      "  --proto <file.proto>        Optional schema digest validation\n"
+      "  --proto-path <dir>          Additional import path (requires --proto)\n"
+      "  --connect-timeout <dur>     Connect timeout per attempt (default 5s)\n"
+      "  --connect-retries <n>       Total connect attempts (default 5)\n"
+      "  --retry-interval <dur>      Delay between connect attempts (default 1s)\n"
+      "  --reconnect                 Resume after a mid-stream connection loss\n"
+      "  --max-gap <dur>             Cap idle gaps between records (default off)\n"
+      "  --strict                    Treat damaged/inconsistent captures as fatal\n"
+      "  --io-threads <n>            IO worker threads (default auto)\n"
+      "\n"
+      "COMMON OPTIONS\n"
       "  --quiet | --verbose         Log level shortcuts\n"
       "  --log-level <lvl>           debug|info|warn|error\n"
       "\n"

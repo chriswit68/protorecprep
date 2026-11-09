@@ -256,6 +256,105 @@ void test_chunk_and_json_options() {
   }
 }
 
+void test_replay_options() {
+  auto parse = [](std::vector<std::string> args, prp::Options& out, std::string& err) {
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (std::string& arg : args) argv.push_back(arg.data());
+    return prp::parse_options(static_cast<int>(argv.size()), argv.data(), out, err);
+  };
+
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "replay", "--rec", "/tmp/a.pcr", "--target", "[::1]:6000",
+                 "--speed", "2.5x", "--direction", "both", "--reconnect", "--connect-timeout",
+                 "250ms", "--connect-retries", "3", "--retry-interval", "10ms", "--max-gap", "1s",
+                 "--strict"},
+                options, err));
+    CHECK_EQ(options.command, std::string("replay"));
+    CHECK_EQ(options.input_file.string(), std::string("/tmp/a.pcr"));
+    CHECK_EQ(options.target_host, std::string("::1"));
+    CHECK_EQ(options.target_port, uint16_t{6000});
+    CHECK_EQ(options.replay_speed, 2.5);
+    CHECK(options.replay_direction == prp::ReplayDirection::Both);
+    CHECK(options.replay_reconnect);
+    CHECK_EQ(options.connect_timeout.count(), int64_t{250});
+    CHECK_EQ(options.connect_retries, uint64_t{3});
+    CHECK_EQ(options.retry_interval.count(), int64_t{10});
+    CHECK_EQ(options.max_gap.count(), int64_t{1000});
+    CHECK(options.strict);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "replay", "--dir", "/tmp/session", "--target", "localhost:1234",
+                 "--direction", "out"},
+                options, err));
+    CHECK_EQ(options.input_dir.string(), std::string("/tmp/session"));
+    CHECK(options.replay_direction == prp::ReplayDirection::Out);
+    CHECK_EQ(options.replay_speed, 1.0);
+  }
+  {
+    // --speed 0 means unthrottled.
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--speed", "0"},
+                options, err));
+    CHECK_EQ(options.replay_speed, 0.0);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr"}, options, err));
+    CHECK(err.find("--target") != std::string::npos);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "replay", "--target", "h:1"}, options, err));
+    CHECK(err.find("--rec") != std::string::npos);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--dir", "d", "--target", "h:1"},
+                 options, err));
+    CHECK(err.find("not both") != std::string::npos);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:0"}, options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h"}, options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", ":42"}, options, err));
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--speed", "-1"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--speed", "nan"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--speed", "inf"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--direction",
+                  "sideways"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--truncate"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1",
+                  "--connect-retries", "0"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1",
+                  "--connect-timeout", "0ms"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--proto-path",
+                  "include"},
+                 options, err));
+  }
+}
+
 void test_config_file() {
   auto parse = [](std::vector<std::string> args, prp::Options& out, std::string& err) {
     std::vector<char*> argv;
@@ -331,6 +430,47 @@ void test_config_file() {
     CHECK(!parse({"protorecprep", "record", "--config", unknown.string(), "--out", "/tmp/x"}, o,
                  err));
     CHECK(err.find("unknown option") != std::string::npos);
+  }
+  {
+    const auto replay_ini = dir / "replay.ini";
+    CHECK(prp::write_file_atomic(replay_ini,
+                                 "[replay]\n"
+                                 "rec = a.pcr\n"
+                                 "target = 127.0.0.1:7777\n"
+                                 "speed = 0\n"
+                                 "direction = out\n"
+                                 "reconnect = true\n"
+                                 "strict = true\n"
+                                 "connect_retries = 2\n"
+                                 "connect_timeout = 250ms\n"
+                                 "max_gap = 2s\n",
+                                 err));
+    prp::Options o;
+    CHECK(parse({"protorecprep", "replay", "--config", replay_ini.string()}, o, err));
+    CHECK_EQ(o.input_file.string(), std::string("a.pcr"));
+    CHECK_EQ(o.target_host, std::string("127.0.0.1"));
+    CHECK_EQ(o.target_port, uint16_t{7777});
+    CHECK_EQ(o.replay_speed, 0.0);
+    CHECK(o.replay_direction == prp::ReplayDirection::Out);
+    CHECK(o.replay_reconnect);
+    CHECK(o.strict);
+    CHECK_EQ(o.connect_retries, uint64_t{2});
+    CHECK_EQ(o.connect_timeout.count(), int64_t{250});
+    CHECK_EQ(o.max_gap.count(), int64_t{2000});
+  }
+  {
+    // Booleans set to false stay disabled.
+    const auto replay_ini = dir / "replay-off.ini";
+    CHECK(prp::write_file_atomic(replay_ini,
+                                 "rec = a.pcr\n"
+                                 "target = h:1\n"
+                                 "reconnect = false\n"
+                                 "strict = false\n",
+                                 err));
+    prp::Options o;
+    CHECK(parse({"protorecprep", "replay", "--config", replay_ini.string()}, o, err));
+    CHECK(!o.replay_reconnect);
+    CHECK(!o.strict);
   }
   std::filesystem::remove_all(dir);
 }
@@ -446,6 +586,129 @@ void test_recorder_roundtrip() {
   }
   CHECK_EQ(data_bytes, expected_bytes);
   CHECK(opens >= results.size());  // stream metadata re-emitted per segment
+
+  std::filesystem::remove_all(dir);
+}
+
+void test_capture_reader() {
+  const auto dir = make_temp_dir("capture-reader");
+  prp::RecorderConfig config;
+  config.out_dir = dir;
+  config.session_id = prp::random_hex(16);
+  config.rotate_bytes = 0;
+  config.fsync_interval = std::chrono::milliseconds(0);
+  config.write_batch_bytes = 1024;
+  config.proto_sha256 = prp::Sha256::digest("reader-proto");
+
+  prp::Recorder recorder(config);
+  std::string err;
+  CHECK(recorder.start(err));
+  const int64_t start = prp::now_wall_ns();
+  recorder.submit(prp::make_stream_open(4, start, "127.0.0.1:9", "demo.Reader"));
+  recorder.submit(prp::make_data(4, prp::Direction::In, start + 1000,
+                                 std::vector<uint8_t>{'a', 'l', 'p', 'h', 'a'}));
+  recorder.submit(prp::make_data(4, prp::Direction::Out, start + 2000,
+                                 std::vector<uint8_t>{'b', 'e', 't', 'a'}));
+  recorder.submit(prp::make_stream_close(4, prp::CloseReason::PeerClosed, start + 3000));
+  recorder.stop();
+  CHECK(!recorder.stats().failed);
+
+  const auto file = dir / "capture-000001.pcr";
+  CHECK(std::filesystem::exists(file));
+
+  prp::rec::FileHeader header;
+  size_t header_size = 0;
+  CHECK(prp::read_capture_header(file, header, header_size, err));
+  CHECK_EQ(header.proto_sha256, prp::Sha256::digest("reader-proto"));
+  CHECK(header_size > prp::rec::kFileHeaderFixedSize);
+
+  std::vector<prp::fs::path> files;
+  CHECK(prp::list_capture_files(dir, files, err));
+  CHECK_EQ(files.size(), size_t{1});
+  CHECK_EQ(files[0].filename().string(), std::string("capture-000001.pcr"));
+
+  {
+    prp::CaptureReader reader;
+    CHECK(reader.open(file, err));
+    std::vector<std::string> data;
+    std::vector<prp::Direction> directions;
+    uint32_t opened = 0;
+    uint32_t closed = 0;
+    uint32_t trailers = 0;
+    std::string peer;
+    std::string type;
+    while (true) {
+      prp::CaptureRecord record;
+      std::string detail;
+      const prp::ReadStatus status = reader.next(record, detail);
+      if (status == prp::ReadStatus::Eof) break;
+      CHECK(status == prp::ReadStatus::Record);
+      switch (record.type) {
+        case prp::rec::RecordType::StreamOpen:
+          ++opened;
+          CHECK_EQ(record.stream_id, uint32_t{4});
+          peer = record.peer;
+          type = record.type_name;
+          break;
+        case prp::rec::RecordType::Data:
+          data.emplace_back(record.data.begin(), record.data.end());
+          directions.push_back(record.dir);
+          break;
+        case prp::rec::RecordType::StreamClose:
+          ++closed;
+          CHECK_EQ(record.close_reason, static_cast<uint8_t>(prp::CloseReason::PeerClosed));
+          break;
+        case prp::rec::RecordType::Trailer:
+          ++trailers;
+          break;
+        case prp::rec::RecordType::Marker:
+          break;
+      }
+    }
+    CHECK_EQ(opened, uint32_t{1});
+    CHECK_EQ(closed, uint32_t{1});
+    CHECK_EQ(trailers, uint32_t{1});
+    CHECK_EQ(peer, std::string("127.0.0.1:9"));
+    CHECK_EQ(type, std::string("demo.Reader"));
+    CHECK_EQ(data.size(), size_t{2});
+    CHECK_EQ(data[0], std::string("alpha"));
+    CHECK_EQ(data[1], std::string("beta"));
+    CHECK(directions[0] == prp::Direction::In);
+    CHECK(directions[1] == prp::Direction::Out);
+  }
+
+  // A damaged tail is reported once, then the reader reports EOF.
+  {
+    std::FILE* f = std::fopen(file.c_str(), "ab");
+    CHECK(f != nullptr);
+    const uint8_t junk[10] = {2, 0x40, 0, 0, 0, 1, 2, 3, 4, 5};
+    std::fwrite(junk, 1, sizeof(junk), f);
+    std::fclose(f);
+  }
+  {
+    prp::CaptureReader reader;
+    CHECK(reader.open(file, err));
+    uint32_t valid = 0;
+    bool damaged = false;
+    for (int i = 0; i < 100; ++i) {
+      prp::CaptureRecord record;
+      std::string detail;
+      const prp::ReadStatus status = reader.next(record, detail);
+      if (status == prp::ReadStatus::Record) {
+        ++valid;
+        continue;
+      }
+      if (status == prp::ReadStatus::Damaged) {
+        damaged = true;
+        CHECK(!detail.empty());
+        continue;
+      }
+      CHECK(status == prp::ReadStatus::Eof);
+      break;
+    }
+    CHECK(damaged);
+    CHECK_EQ(valid, uint32_t{5});
+  }
 
   std::filesystem::remove_all(dir);
 }
@@ -610,11 +873,13 @@ int main(int argc, char** argv) {
   test_parsers();
   test_filter_options();
   test_chunk_and_json_options();
+  test_replay_options();
   test_config_file();
   test_framer();
   test_item_queue();
   test_file_header();
   test_recorder_roundtrip();
+  test_capture_reader();
   test_truncation_recovery();
   test_json_escape();
   if (with_proto) {
