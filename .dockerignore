@@ -1,0 +1,14 @@
+.git
+.gitignore
+build/
+build-*/
+.cache/
+CMakeFiles/
+CMakeCache.txt
+.DS_Store
+*.pcr
+captures/
+recordings/
+__pycache__/
+*.pyc
+doc/

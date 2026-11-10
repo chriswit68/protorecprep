@@ -1,0 +1,22 @@
+services:
+  protorecprep:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
+        ABSEIL_VERSION: ${ABSEIL_VERSION:-20250512.1}
+        PROTOBUF_VERSION: ${PROTOBUF_VERSION:-36.2}
+    image: protorecprep:latest
+    init: true
+    ports:
+      - "${PRP_PORT:-5000}:5000"
+    volumes:
+      - ./recordings:/data/recordings
+      - ./proto:/data/proto:ro
+      - ./etc:/data/etc:ro
+    working_dir: /data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["record", "--config", "etc/docker.ini"]
+    stop_grace_period: 15s
