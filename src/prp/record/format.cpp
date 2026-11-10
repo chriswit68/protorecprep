@@ -22,6 +22,7 @@ const char* framing_name(Framing framing) {
   switch (framing) {
     case Framing::Raw: return "raw";
     case Framing::VarintLength: return "varint-length";
+    case Framing::TypedLengthLE: return "typed-length-le";
   }
   return "unknown";
 }
@@ -33,6 +34,10 @@ bool parse_framing(std::string_view text, Framing& out) {
   }
   if (text == "varint" || text == "varint-length" || text == "length-prefixed") {
     out = Framing::VarintLength;
+    return true;
+  }
+  if (text == "typed" || text == "typed-length" || text == "typed-length-le") {
+    out = Framing::TypedLengthLE;
     return true;
   }
   return false;
@@ -93,7 +98,7 @@ bool decode_file_header(const uint8_t* data, size_t size, FileHeader& out, size_
     return false;
   }
   const uint8_t framing_byte = data[28];
-  if (framing_byte > 1) {
+  if (framing_byte > static_cast<uint8_t>(Framing::TypedLengthLE)) {
     err = "invalid framing byte in header";
     return false;
   }

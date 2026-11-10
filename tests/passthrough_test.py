@@ -239,39 +239,6 @@ def test_multi_stream(binary: str, workdir: str) -> None:
           f"recorded per-stream payloads differ: {recorded}")
 
 
-def test_filter_does_not_affect_forwarding(binary: str, workdir: str) -> None:
-    out_dir = os.path.join(workdir, "filter")
-    sink = SinkServer()
-    listen_port = pick_port()
-    proc, stderr_file, stderr_path = start_passthrough(
-        binary,
-        out_dir,
-        listen_port,
-        sink.port,
-        extra_args=["--message-type", "demo.Inbound", "--filter", "demo.Other"],
-    )
-    payload = b"forwarded-even-though-not-recorded"
-    try:
-        sock = wait_for_server(listen_port, time.time() + 10.0)
-        sock.sendall(payload)
-        sock.close()
-        sink.wait_bytes(len(payload), time.time() + 10.0)
-        check(sink.data() == payload, "filter unexpectedly suppressed forwarding")
-    finally:
-        finish_passthrough(proc, stderr_file, stderr_path)
-        sink.close()
-
-    # The filter excluded the inbound type, so the capture holds no data.
-    received, result, connections = replay_to_sink(
-        binary,
-        ["--dir", out_dir],
-        ["--speed", "0", "--direction", "in", "--log-level", "warn"],
-    )
-    check(result.returncode == 0, f"replaying filtered capture failed: {result.stderr}")
-    check(received == b"", f"filtered capture unexpectedly contains {len(received)} bytes")
-    check(connections == 0, f"filtered capture opened {connections} target connection(s)")
-
-
 def test_unreachable_target(binary: str, workdir: str) -> None:
     out_dir = os.path.join(workdir, "unreachable")
     dead_port = pick_port()
@@ -383,37 +350,6 @@ def test_response_forwarding(binary: str, workdir: str) -> None:
           "captured responses differ from the live response")
     check(replay_direction(binary, out_dir, "in") == request,
           "captured requests differ from the live request")
-
-
-def test_response_filter_independence(binary: str, workdir: str) -> None:
-    out_dir = os.path.join(workdir, "response-filter")
-    response = b"always-recorded-response"
-    sink = RespondingServer(response)
-    listen_port = pick_port()
-    proc, stderr_file, stderr_path = start_passthrough(
-        binary,
-        out_dir,
-        listen_port,
-        sink.port,
-        extra_args=["--message-type", "demo.Inbound", "--filter", "demo.Other"],
-    )
-    request = b"filtered-inbound"
-    try:
-        sock = wait_for_server(listen_port, time.time() + 10.0)
-        sock.sendall(request)
-        received = recv_until(sock, len(response), time.time() + 10.0)
-        check(received == response, f"filtered passthrough lost the response: {received!r}")
-        sock.close()
-        time.sleep(0.2)
-    finally:
-        output = finish_passthrough(proc, stderr_file, stderr_path)
-        sink.close()
-    check("target responses are always recorded" in output,
-          f"missing passthrough filter warning: {output}")
-    check(replay_direction(binary, out_dir, "out") == response,
-          "the type filter suppressed the response capture")
-    check(replay_direction(binary, out_dir, "in") == b"",
-          "the type filter unexpectedly recorded inbound data")
 
 
 def test_target_eof_keeps_client(binary: str, workdir: str) -> None:
@@ -561,9 +497,7 @@ def main() -> int:
     try:
         test_basic(binary, workdir)
         test_multi_stream(binary, workdir)
-        test_filter_does_not_affect_forwarding(binary, workdir)
         test_response_forwarding(binary, workdir)
-        test_response_filter_independence(binary, workdir)
         test_target_eof_keeps_client(binary, workdir)
         test_response_backpressure(binary, workdir)
         test_unreachable_target(binary, workdir)

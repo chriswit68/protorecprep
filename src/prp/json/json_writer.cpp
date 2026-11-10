@@ -15,7 +15,8 @@ struct JsonWriter::StreamState {
     std::string type_name;
     const google::protobuf::Descriptor* descriptor = nullptr;
     std::unique_ptr<google::protobuf::Message> message;
-    std::unique_ptr<FrameReader> reader;  // only for varint framing
+    std::map<uint32_t, std::unique_ptr<google::protobuf::Message>> typed_messages;
+    std::unique_ptr<FrameReader> reader;  // only for non-raw framing
     bool resolved = false;
   };
 
@@ -106,9 +107,13 @@ void JsonWriter::prepare_channel(StreamState& state, uint32_t stream_id, bool ou
   channel.type_name = effective;
   channel.descriptor = nullptr;
   channel.message.reset();
+  channel.typed_messages.clear();
   channel.resolved = true;
   if (!effective.empty() && config_.schema && config_.schema->loaded()) {
     channel.descriptor = config_.schema->find_message(effective);
+    if (!channel.descriptor && !config_.proto_package.empty()) {
+      channel.descriptor = config_.schema->find_message(config_.proto_package + "." + effective);
+    }
     if (!channel.descriptor) {
       log_printf(LogLevel::Warn, "stream %u: message type '%s' not found in schema", stream_id,
                  effective.c_str());
@@ -117,8 +122,8 @@ void JsonWriter::prepare_channel(StreamState& state, uint32_t stream_id, bool ou
   if (channel.descriptor && factory_) {
     channel.message.reset(factory_->GetPrototype(channel.descriptor)->New());
   }
-  if (config_.framing == rec::Framing::VarintLength && !channel.reader) {
-    channel.reader = std::make_unique<FrameReader>(config_.max_frame);
+  if (config_.framing != rec::Framing::Raw && !channel.reader) {
+    channel.reader = std::make_unique<FrameReader>(config_.framing, config_.max_frame);
   }
 }
 
@@ -134,11 +139,12 @@ void JsonWriter::emit_event_prefix(const char* event, uint32_t stream_id, int64_
 }
 
 void JsonWriter::emit_message(uint32_t stream_id, Direction dir, int64_t ts_ns, std::string_view type_name,
-                              const google::protobuf::Message& message) {
+                              const google::protobuf::Message& message, uint32_t type_id, bool has_type) {
   std::string json;
   std::string err;
   if (!message_to_json(message, config_.print_defaults, config_.preserve_proto_names, json, err)) {
-    emit_unparsed(stream_id, dir, ts_ns, "json conversion failed: " + err, nullptr, 0);
+    emit_unparsed(stream_id, dir, ts_ns, "json conversion failed: " + err, nullptr, 0, type_id,
+                  has_type);
     return;
   }
   buffer_ += "{\"seq\":";
@@ -151,7 +157,12 @@ void JsonWriter::emit_message(uint32_t stream_id, Direction dir, int64_t ts_ns, 
   buffer_ += dir == Direction::In ? "in" : "out";
   buffer_ += "\",\"type\":\"";
   buffer_ += json_escape(type_name);
-  buffer_ += "\",\"message\":";
+  buffer_ += "\"";
+  if (has_type) {
+    buffer_ += ",\"type_id\":";
+    buffer_ += std::to_string(type_id);
+  }
+  buffer_ += ",\"message\":";
   buffer_ += json;
   buffer_ += "}\n";
   events_.fetch_add(1, std::memory_order_relaxed);
@@ -159,7 +170,7 @@ void JsonWriter::emit_message(uint32_t stream_id, Direction dir, int64_t ts_ns, 
 }
 
 void JsonWriter::emit_unparsed(uint32_t stream_id, Direction dir, int64_t ts_ns, std::string_view reason,
-                               const uint8_t* bytes, size_t len) {
+                               const uint8_t* bytes, size_t len, uint32_t type_id, bool has_type) {
   buffer_ += "{\"seq\":";
   buffer_ += std::to_string(++seq_);
   buffer_ += ",\"ts_ns\":";
@@ -171,6 +182,10 @@ void JsonWriter::emit_unparsed(uint32_t stream_id, Direction dir, int64_t ts_ns,
   buffer_ += "\",\"unparsed\":true,\"reason\":\"";
   buffer_ += json_escape(reason);
   buffer_ += "\"";
+  if (has_type) {
+    buffer_ += ",\"type_id\":";
+    buffer_ += std::to_string(type_id);
+  }
   if (bytes && len > 0) {
     buffer_ += ",\"bytes_b64\":\"";
     buffer_ += base64_encode(bytes, len);
@@ -214,11 +229,68 @@ void JsonWriter::handle_data(const CaptureItem& item) {
   const bool outbound = item.dir == Direction::Out;
   prepare_channel(*state, item.stream_id, outbound, item.type_name);
   StreamState::Channel& channel = outbound ? state->out : state->in;
-  if (!channel.reader) channel.reader = std::make_unique<FrameReader>(config_.max_frame);
+  if (!channel.reader) {
+    channel.reader = std::make_unique<FrameReader>(config_.framing, config_.max_frame);
+  }
   channel.reader->append(item.data.data(), item.data.size());
 
-  std::string_view frame;
   std::string err;
+  if (config_.framing == rec::Framing::TypedLengthLE) {
+    FrameReader::Frame frame;
+    while (true) {
+      const FrameReader::Result result = channel.reader->next(frame, err);
+      if (result == FrameReader::Result::NeedMore) break;
+      if (result == FrameReader::Result::Error) {
+        parse_errors_.fetch_add(1, std::memory_order_relaxed);
+        emit_unparsed(item.stream_id, item.dir, item.ts_ns, "framing error: " + err, nullptr, 0);
+        channel.reader->clear();
+        break;
+      }
+      const auto mapped = config_.type_map.find(frame.type_id);
+      if (mapped == config_.type_map.end()) {
+        emit_unparsed(item.stream_id, item.dir, item.ts_ns,
+                      "unknown message type id " + std::to_string(frame.type_id),
+                      reinterpret_cast<const uint8_t*>(frame.payload.data()), frame.payload.size(),
+                      frame.type_id, true);
+        continue;
+      }
+      const google::protobuf::Descriptor* descriptor = nullptr;
+      if (config_.schema) {
+        descriptor = config_.schema->find_message(mapped->second);
+        if (!descriptor && !config_.proto_package.empty()) {
+          descriptor = config_.schema->find_message(config_.proto_package + "." + mapped->second);
+        }
+      }
+      if (!descriptor) {
+        emit_unparsed(item.stream_id, item.dir, item.ts_ns,
+                      "message type '" + mapped->second + "' not found in schema",
+                      reinterpret_cast<const uint8_t*>(frame.payload.data()), frame.payload.size(),
+                      frame.type_id, true);
+        continue;
+      }
+      if (!factory_) {
+        emit_unparsed(item.stream_id, item.dir, item.ts_ns, "schema not loaded",
+                      reinterpret_cast<const uint8_t*>(frame.payload.data()), frame.payload.size(),
+                      frame.type_id, true);
+        continue;
+      }
+      std::unique_ptr<google::protobuf::Message>& message = channel.typed_messages[frame.type_id];
+      if (!message) message.reset(factory_->GetPrototype(descriptor)->New());
+      message->Clear();
+      if (!message->ParseFromArray(frame.payload.data(), static_cast<int>(frame.payload.size()))) {
+        parse_errors_.fetch_add(1, std::memory_order_relaxed);
+        emit_unparsed(item.stream_id, item.dir, item.ts_ns, "protobuf parse failed",
+                      reinterpret_cast<const uint8_t*>(frame.payload.data()), frame.payload.size(),
+                      frame.type_id, true);
+        continue;
+      }
+      emit_message(item.stream_id, item.dir, item.ts_ns, std::string(descriptor->full_name()),
+                   *message, frame.type_id, true);
+    }
+    return;
+  }
+
+  std::string_view frame;
   while (true) {
     const FrameReader::Result result = channel.reader->next(frame, err);
     if (result == FrameReader::Result::NeedMore) break;

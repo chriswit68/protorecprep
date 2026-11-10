@@ -20,6 +20,11 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/passthrough_test.py
             $<TARGET_FILE:protorecprep> ${CMAKE_CURRENT_SOURCE_DIR}/../proto/sample.proto)
   set_tests_properties(passthrough PROPERTIES TIMEOUT 180)
+
+  add_test(NAME typed
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/typed_test.py
+            $<TARGET_FILE:protorecprep> ${CMAKE_CURRENT_SOURCE_DIR}/../proto/sample.proto)
+  set_tests_properties(typed PROPERTIES TIMEOUT 90)
 endif()
 
 # Work around protobuf/absl crashing under ASan/TSan (upstream issue with the

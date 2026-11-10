@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -40,8 +41,10 @@ struct Options {
   fs::path proto_file;
   std::vector<fs::path> proto_paths;
   std::string message_type;
-  // Allowlist of message type names to record. Empty = record everything.
-  std::vector<std::string> type_filter;
+  // Package prefix applied when a type-map name is not fully qualified. The
+  // type-map itself is the only source of message ids for typed framing.
+  std::string proto_package;
+  std::map<uint32_t, std::string> type_map;  // message type id -> proto message name
   rec::Framing framing = rec::Framing::VarintLength;
   bool json_enabled = false;
   // JSONL data file override. Relative paths are resolved against the session

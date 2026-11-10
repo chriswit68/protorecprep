@@ -180,7 +180,7 @@ void test_item_queue() {
   }
 }
 
-void test_filter_options() {
+void test_type_map_options() {
   auto parse = [](std::vector<std::string> args, prp::Options& out, std::string& err) {
     std::vector<char*> argv;
     argv.reserve(args.size());
@@ -192,26 +192,66 @@ void test_filter_options() {
     prp::Options options;
     std::string err;
     CHECK(parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
-                 "--message-type", "demo.A", "--filter", "demo.A, demo.B", "--filter", "demo.C,demo.A"},
+                 "--framing", "typed", "--proto-package", "demo",
+                 "--type-map", "0=VersionInformation", "--type-map", "0x10=demo.Nested"},
                 options, err));
-    CHECK_EQ(options.type_filter.size(), size_t{3});
-    CHECK_EQ(options.type_filter[0], std::string("demo.A"));
-    CHECK_EQ(options.type_filter[1], std::string("demo.B"));
-    CHECK_EQ(options.type_filter[2], std::string("demo.C"));
+    CHECK(options.framing == prp::rec::Framing::TypedLengthLE);
+    CHECK_EQ(options.proto_package, std::string("demo"));
+    CHECK_EQ(options.type_map.size(), size_t{2});
+    CHECK_EQ(options.type_map.at(0), std::string("VersionInformation"));
+    CHECK_EQ(options.type_map.at(16), std::string("demo.Nested"));
   }
   {
+    // --message-type is rejected with typed framing.
     prp::Options options;
     std::string err;
-    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--filter", "demo.A"}, options, err));
-    CHECK(err.find("--filter requires --message-type") != std::string::npos);
-  }
-  {
-    prp::Options options;
-    std::string err;
-    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--message-type", "demo.A",
-                  "--filter", "demo.A,,demo.B"},
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--message-type", "demo.A", "--framing", "typed", "--type-map", "1=demo.A"},
                  options, err));
-    CHECK(err.find("empty message type") != std::string::npos);
+    CHECK(err.find("--message-type") != std::string::npos);
+  }
+  {
+    // A type map requires a schema.
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--framing", "typed",
+                  "--type-map", "1=demo.A"},
+                 options, err));
+    CHECK(err.find("--type-map requires --proto") != std::string::npos);
+  }
+  {
+    // JSON with typed framing requires at least one mapping.
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--framing", "typed", "--json"},
+                 options, err));
+    CHECK(err.find("--type-map") != std::string::npos);
+  }
+  {
+    // Invalid id and duplicate ids are rejected.
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--type-map", "notanumber=demo.A"},
+                 options, err));
+    CHECK(err.find("invalid message type id") != std::string::npos);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--type-map", "1=demo.A", "--type-map", "1=demo.B"},
+                 options, err));
+    CHECK(err.find("duplicate message type id") != std::string::npos);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--type-map", "1=demo.A", "--type-map", "2=demo.A"},
+                 options, err));
+    CHECK(err.find("duplicate message name") != std::string::npos);
   }
 }
 
@@ -481,7 +521,8 @@ void test_config_file() {
       "proto_path = /tmp/inc1\n"
       "proto-path = /tmp/inc2\n"
       "message_type = demo.Config\n"
-      "filter = demo.A, demo.B\n"
+      "type_map = 0=demo.A\n"
+      "type_map = 1=demo.B\n"
       "json = true\n"
       "json_file = custom.jsonl\n"
       "chunk_interval = 45s\n"
@@ -498,7 +539,9 @@ void test_config_file() {
     CHECK_EQ(o.proto_file.string(), std::string("sample.proto"));
     CHECK_EQ(o.proto_paths.size(), size_t{2});
     CHECK_EQ(o.message_type, std::string("demo.Config"));
-    CHECK_EQ(o.type_filter.size(), size_t{2});
+    CHECK_EQ(o.type_map.size(), size_t{2});
+    CHECK_EQ(o.type_map.at(0), std::string("demo.A"));
+    CHECK_EQ(o.type_map.at(1), std::string("demo.B"));
     CHECK(o.json_enabled);
     CHECK_EQ(o.json_file.string(), std::string("custom.jsonl"));
     CHECK_EQ(o.rotate_interval.count(), int64_t{45 * 1000});
@@ -606,7 +649,7 @@ void test_framer() {
   err.clear();
   CHECK(!malformed.feed(bad, sizeof(bad), err));
 
-  prp::FrameReader reader(4096);
+  prp::FrameReader reader(prp::rec::Framing::VarintLength, 4096);
   const std::string w1 = prp::frame_message("one");
   const std::string w2 = prp::frame_message("second");
   std::string data = w1 + w2.substr(0, 2);
@@ -619,6 +662,39 @@ void test_framer() {
   CHECK(reader.next(frame, err) == prp::FrameReader::Result::Frame);
   CHECK_EQ(std::string(frame), std::string("second"));
   CHECK(reader.next(frame, err) == prp::FrameReader::Result::NeedMore);
+
+  // Typed framing carries the message type id in an 8-byte header.
+  err.clear();
+  prp::FrameValidator typed_validator(prp::rec::Framing::TypedLengthLE, 4096);
+  std::string typed_wire = prp::frame_typed_message(0, "hello") +
+                           prp::frame_typed_message(0x10, "world!");
+  CHECK(typed_validator.feed(reinterpret_cast<const uint8_t*>(typed_wire.data()), 3, err));
+  CHECK(typed_validator.feed(reinterpret_cast<const uint8_t*>(typed_wire.data()) + 3,
+                             typed_wire.size() - 3, err));
+  CHECK_EQ(typed_validator.frames(), 2ull);
+  CHECK(err.empty());
+
+  prp::FrameReader typed_reader(prp::rec::Framing::TypedLengthLE, 4096);
+  const size_t first_typed = prp::kTypedHeaderSize + 5;
+  typed_reader.append(reinterpret_cast<const uint8_t*>(typed_wire.data()), first_typed + 3);
+  prp::FrameReader::Frame typed_frame;
+  CHECK(typed_reader.next(typed_frame, err) == prp::FrameReader::Result::Frame);
+  CHECK_EQ(typed_frame.type_id, 0u);
+  CHECK_EQ(std::string(typed_frame.payload), std::string("hello"));
+  CHECK_EQ(typed_frame.wire.size(), prp::kTypedHeaderSize + 5);
+  CHECK(typed_reader.next(typed_frame, err) == prp::FrameReader::Result::NeedMore);
+  typed_reader.append(reinterpret_cast<const uint8_t*>(typed_wire.data()) + first_typed + 3,
+                      typed_wire.size() - first_typed - 3);
+  CHECK(typed_reader.next(typed_frame, err) == prp::FrameReader::Result::Frame);
+  CHECK_EQ(typed_frame.type_id, 0x10u);
+  CHECK_EQ(std::string(typed_frame.payload), std::string("world!"));
+
+  // Oversized typed frames are rejected.
+  prp::FrameValidator typed_big(prp::rec::Framing::TypedLengthLE, 4);
+  std::string big_typed = prp::frame_typed_message(1, "hello");
+  err.clear();
+  CHECK(!typed_big.feed(reinterpret_cast<const uint8_t*>(big_typed.data()), big_typed.size(), err));
+  CHECK(!err.empty());
 }
 
 void test_file_header() {
@@ -640,6 +716,14 @@ void test_file_header() {
   CHECK(decoded.session_uuid == header.session_uuid);
   CHECK(decoded.proto_sha256 == header.proto_sha256);
   CHECK_EQ(decoded.descriptor_set, std::string("descriptor-bytes"));
+
+  header.framing = prp::rec::Framing::TypedLengthLE;
+  const auto typed_encoded = prp::rec::encode_file_header(header);
+  prp::rec::FileHeader typed_decoded;
+  consumed = 0;
+  CHECK(prp::rec::decode_file_header(typed_encoded.data(), typed_encoded.size(), typed_decoded,
+                                     consumed, err));
+  CHECK_EQ(typed_decoded.framing, prp::rec::Framing::TypedLengthLE);
 
   auto corrupted = encoded;
   corrupted[corrupted.size() - 1] ^= 0xFF;
@@ -961,6 +1045,61 @@ void test_json_writer(const char* proto_path) {
   std::filesystem::remove_all(dir);
 }
 
+void test_typed_json_writer(const char* proto_path) {
+  const auto dir = make_temp_dir("json-typed");
+  prp::Schema schema;
+  std::string err;
+  CHECK(schema.load(proto_path, {}, err));
+
+  google::protobuf::DynamicMessageFactory factory(schema.pool());
+  std::unique_ptr<google::protobuf::Message> record(
+      factory.GetPrototype(schema.find_message("demo.TestRecord"))->New());
+  CHECK(prp::json_to_message("{\"seq\":42,\"name\":\"typed\"}", *record, false, err));
+  std::string record_bytes;
+  CHECK(record->SerializeToString(&record_bytes));
+
+  std::unique_ptr<google::protobuf::Message> nested(
+      factory.GetPrototype(schema.find_message("demo.Nested"))->New());
+  CHECK(prp::json_to_message("{\"kind\":\"nested-typed\"}", *nested, false, err));
+  std::string nested_bytes;
+  CHECK(nested->SerializeToString(&nested_bytes));
+
+  const std::string wire = prp::frame_typed_message(1, record_bytes) +
+                           prp::frame_typed_message(2, nested_bytes) +
+                           prp::frame_typed_message(9, "unknown");
+
+  prp::JsonWriterConfig config;
+  config.output_path = dir / "events.jsonl";
+  config.schema = &schema;
+  config.framing = prp::rec::Framing::TypedLengthLE;
+  config.type_map = {{1, "demo.TestRecord"}, {2, "demo.Nested"}};
+  prp::JsonWriter writer(config);
+  CHECK(writer.start(err));
+
+  writer.submit(prp::make_stream_open(1, prp::now_wall_ns(), "peer:1", ""));
+  writer.submit(prp::make_data(1, prp::Direction::In, prp::now_wall_ns(),
+                               std::vector<uint8_t>(wire.begin(), wire.end())));
+  writer.submit(prp::make_stream_close(1, prp::CloseReason::PeerClosed, prp::now_wall_ns()));
+  writer.stop();
+
+  const auto stats = writer.stats();
+  CHECK(!stats.failed);
+  CHECK_EQ(stats.messages, 2ull);
+  CHECK_EQ(stats.unparsed, 1ull);
+  CHECK_EQ(stats.parse_errors, 0ull);
+
+  std::string content;
+  CHECK(prp::read_file(config.output_path, content, err));
+  CHECK(content.find("\"type\":\"demo.TestRecord\",\"type_id\":1") != std::string::npos);
+  CHECK(content.find("\"type\":\"demo.Nested\",\"type_id\":2") != std::string::npos);
+  CHECK(content.find("\"unparsed\":true") != std::string::npos);
+  CHECK(content.find("\"type_id\":9") != std::string::npos);
+  CHECK(content.find("typed") != std::string::npos);
+  CHECK(content.find("nested-typed") != std::string::npos);
+
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -979,7 +1118,7 @@ int main(int argc, char** argv) {
   test_sha256();
   test_base64();
   test_parsers();
-  test_filter_options();
+  test_type_map_options();
   test_chunk_and_json_options();
   test_replay_options();
   test_passthrough_options();
@@ -994,6 +1133,7 @@ int main(int argc, char** argv) {
   if (with_proto) {
     test_schema(proto);
     test_json_writer(proto);
+    test_typed_json_writer(proto);
   }
 
   if (g_failures != 0) {

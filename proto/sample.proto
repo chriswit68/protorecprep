@@ -16,3 +16,6 @@ message Nested {
 }
 
 message EmptyMessage {}
+
+// Placeholder for the fixed type id 0 of the typed 8-byte header protocol.
+message VersionInformation {}

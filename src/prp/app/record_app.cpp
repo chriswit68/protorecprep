@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -34,11 +35,8 @@ namespace {
 namespace asio = boost::asio;
 using ErrorCode = boost::system::error_code;
 
-bool filter_has(const std::vector<std::string>& filter, const std::string& type_name) {
-  return !type_name.empty() && std::find(filter.begin(), filter.end(), type_name) != filter.end();
-}
-
-std::string uuid_hex(const std::array<uint8_t, 16>& uuid) {  static constexpr char kHex[] = "0123456789abcdef";
+std::string uuid_hex(const std::array<uint8_t, 16>& uuid) {
+  static constexpr char kHex[] = "0123456789abcdef";
   std::string out;
   out.reserve(32);
   for (uint8_t b : uuid) {
@@ -48,9 +46,41 @@ std::string uuid_hex(const std::array<uint8_t, 16>& uuid) {  static constexpr ch
   return out;
 }
 
+const google::protobuf::Descriptor* find_descriptor(const Schema& schema, const std::string& name,
+                                                    const std::string& package) {
+  const google::protobuf::Descriptor* descriptor = schema.find_message(name);
+  if (!descriptor && !package.empty()) {
+    descriptor = schema.find_message(package + "." + name);
+  }
+  return descriptor;
+}
+
+bool resolve_type_map(const std::map<uint32_t, std::string>& input, const std::string& package,
+                      const Schema& schema, std::map<uint32_t, std::string>& out, std::string& err) {
+  out.clear();
+  for (const auto& [type_id, name] : input) {
+    const google::protobuf::Descriptor* descriptor = find_descriptor(schema, name, package);
+    if (!descriptor) {
+      err = "type-map message '" + name + "' (id " + std::to_string(type_id) + ") not found in schema";
+      return false;
+    }
+    const std::string full_name(descriptor->full_name());
+    for (const auto& [existing_id, existing_name] : out) {
+      if (existing_name == full_name) {
+        err = "duplicate type-map message '" + full_name + "' (ids " +
+              std::to_string(existing_id) + " and " + std::to_string(type_id) + ")";
+        return false;
+      }
+    }
+    out.emplace(type_id, full_name);
+  }
+  return true;
+}
+
 std::string meta_json(const Options& options, const Schema& schema, const fs::path& session_dir,
                       const fs::path& json_path, const std::string& session_id, const SendSpec& send,
-                      const ForwardConfig& forward) {
+                      const ForwardConfig& forward,
+                      const std::map<uint32_t, std::string>& type_map) {
   const char* framing = rec::framing_name(options.framing);
   std::string json = "{\n";
   json += "  \"tool\": \"protorecprep\",\n";
@@ -66,12 +96,14 @@ std::string meta_json(const Options& options, const Schema& schema, const fs::pa
   json += "  \"proto\": \"" + json_escape(options.proto_file.string()) + "\",\n";
   json += "  \"proto_sha256\": \"" + schema.digest_hex() + "\",\n";
   json += "  \"message_type\": \"" + json_escape(options.message_type) + "\",\n";
-  json += "  \"filter\": [";
-  for (size_t i = 0; i < options.type_filter.size(); ++i) {
-    if (i != 0) json += ", ";
-    json += "\"" + json_escape(options.type_filter[i]) + "\"";
+  json += "  \"proto_package\": \"" + json_escape(options.proto_package) + "\",\n";
+  json += "  \"type_map\": {";
+  size_t map_index = 0;
+  for (const auto& [type_id, type_name] : type_map) {
+    if (map_index++ != 0) json += ", ";
+    json += "\"" + std::to_string(type_id) + "\": \"" + json_escape(type_name) + "\"";
   }
-  json += "],\n";
+  json += "},\n";
   json += "  \"json\": " + std::string(options.json_enabled ? "true" : "false") + ",\n";
   if (options.json_enabled) {
     json += "  \"json_file\": \"" + json_escape(json_path.string()) + "\",\n";
@@ -149,18 +181,31 @@ int run_server_mode(const Options& options, std::string& err) {
   if (!ensure_directory(session_dir, err)) return fail(err);
 
   Schema schema;
+  std::string default_type_name;
+  std::map<uint32_t, std::string> type_map;
   if (!options.proto_file.empty()) {
     if (!schema.load(options.proto_file, options.proto_paths, err)) {
       log_error("schema error: " + err);
       return 2;
     }
-    if (!options.message_type.empty() && schema.find_message(options.message_type) == nullptr) {
-      return fail("message type '" + options.message_type + "' not found in schema");
-    }
-    for (const std::string& type : options.type_filter) {
-      if (schema.find_message(type) == nullptr) {
-        return fail("filter message type '" + type + "' not found in schema");
+    if (!options.message_type.empty()) {
+      const google::protobuf::Descriptor* descriptor =
+          find_descriptor(schema, options.message_type, options.proto_package);
+      if (!descriptor) {
+        return fail("message type '" + options.message_type + "' not found in schema");
       }
+      default_type_name = std::string(descriptor->full_name());
+    }
+    if (!options.type_map.empty()) {
+      if (!resolve_type_map(options.type_map, options.proto_package, schema, type_map, err)) {
+        return fail(err);
+      }
+      std::string joined;
+      for (const auto& [type_id, type_name] : type_map) {
+        if (!joined.empty()) joined += ", ";
+        joined += std::to_string(type_id) + "=" + type_name;
+      }
+      log_printf(LogLevel::Info, "message type map: %s", joined.c_str());
     }
   }
 
@@ -174,7 +219,8 @@ int run_server_mode(const Options& options, std::string& err) {
     if (!schema.loaded()) {
       return fail("--send-type requires a loaded schema");
     }
-    const google::protobuf::Descriptor* descriptor = schema.find_message(options.send.type);
+    const google::protobuf::Descriptor* descriptor =
+        find_descriptor(schema, options.send.type, options.proto_package);
     if (!descriptor) {
       return fail("send message type '" + options.send.type + "' not found in schema");
     }
@@ -194,11 +240,31 @@ int run_server_mode(const Options& options, std::string& err) {
     if (!message->SerializeToString(&serialized)) {
       return fail("could not serialize outbound message");
     }
+    std::string framed;
+    if (options.framing == rec::Framing::VarintLength) {
+      framed = frame_message(serialized);
+    } else if (options.framing == rec::Framing::TypedLengthLE) {
+      uint32_t type_id = 0;
+      bool found = false;
+      for (const auto& [id, name] : type_map) {
+        if (name == std::string(descriptor->full_name())) {
+          type_id = id;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return fail("send message type '" + std::string(descriptor->full_name()) +
+                    "' has no --type-map entry for typed framing");
+      }
+      framed = frame_typed_message(type_id, serialized);
+    } else {
+      framed = serialized;
+    }
     send.enabled = true;
-    send.type_name = options.send.type;
+    send.type_name = std::string(descriptor->full_name());
     send.json_content = content;
-    send.framed_bytes =
-        options.framing == rec::Framing::VarintLength ? frame_message(serialized) : serialized;
+    send.framed_bytes = std::move(framed);
     send.once_after = options.send.once_after;
     send.has_once_after = options.send.has_once;
     send.every = options.send.every;
@@ -211,29 +277,6 @@ int run_server_mode(const Options& options, std::string& err) {
     if (send.has_every && send.every.count() <= 0) {
       return fail("--send-every must be greater than zero");
     }
-  }
-
-  if (!options.type_filter.empty()) {
-    if (!filter_has(options.type_filter, options.message_type) &&
-        !(send.enabled && filter_has(options.type_filter, send.type_name))) {
-      if (passthrough) {
-        log_printf(LogLevel::Warn,
-                   "type filter does not match inbound '%s'; inbound will not be recorded "
-                   "(target responses are always recorded)",
-                   options.message_type.c_str());
-      } else {
-        log_printf(LogLevel::Warn,
-                   "type filter matches neither inbound '%s' nor outbound '%s'; "
-                   "nothing will be recorded",
-                   options.message_type.c_str(), send.type_name.c_str());
-      }
-    }
-    std::string joined;
-    for (const std::string& type : options.type_filter) {
-      if (!joined.empty()) joined += ", ";
-      joined += type;
-    }
-    log_printf(LogLevel::Info, "recording only message types: %s", joined.c_str());
   }
 
   RecorderConfig recorder_config;
@@ -270,7 +313,9 @@ int run_server_mode(const Options& options, std::string& err) {
     JsonWriterConfig json_config;
     json_config.output_path = json_path;
     json_config.schema = &schema;
-    json_config.default_type_name = options.message_type;
+    json_config.default_type_name = default_type_name;
+    json_config.proto_package = options.proto_package;
+    json_config.type_map = type_map;
     json_config.framing = options.framing;
     json_config.max_frame = options.max_frame;
     json_config.print_defaults = options.json_print_defaults;
@@ -282,8 +327,7 @@ int run_server_mode(const Options& options, std::string& err) {
   server_config.listen_host = options.listen_host;
   server_config.listen_port = options.listen_port;
   server_config.framing = options.framing;
-  server_config.default_type_name = options.message_type;
-  server_config.type_filter = options.type_filter;
+  server_config.default_type_name = default_type_name;
   server_config.recv_buffer = options.recv_buffer;
   server_config.max_frame = options.max_frame;
   server_config.max_connections = options.max_connections;
@@ -303,7 +347,7 @@ int run_server_mode(const Options& options, std::string& err) {
   Server server(io, server_config, recorder, json.get());
 
   const std::string meta = meta_json(options, schema, session_dir, json_path, session_id, send,
-                                     server_config.forward);
+                                     server_config.forward, type_map);
   if (!write_file_atomic(session_dir / "meta.json", meta, err)) {
     log_error("could not write meta.json: " + err);
     return 2;

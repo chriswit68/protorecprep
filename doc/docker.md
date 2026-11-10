@@ -91,6 +91,74 @@ docker compose run --rm protorecprep \
 Alternativ kann das Kommando dauerhaft in `compose.yaml` geändert werden
 (`command:`).
 
+## Typed-Header-Protokoll (8 Byte)
+
+Für Server mit dem 8-Byte-Header wird `framing = typed-length-le` gesetzt.
+Jeder Frame beginnt mit zwei Little-Endian-`uint32`:
+
+| Offset | Größe | Inhalt                                   |
+|--------|-------|------------------------------------------|
+| 0      | 4     | Message-Typ-ID (Little-Endian)           |
+| 4      | 4     | Payload-Länge in Byte (ohne Header)      |
+| 8      | n     | Protobuf-Payload                         |
+
+Alle Message-Typen laufen über dieselbe TCP-Verbindung; die ID im Header
+bestimmt den Proto-Typ. Die Zuordnung wird ausschließlich manuell über
+`type_map` gepflegt (`<id>=<Message>`). Nur ID `0` ist durch das Protokoll
+festgelegt (`VersionInformation`); weitere IDs kommen mit der Zeit dazu.
+
+`proto_package` wird als Präfix verwendet, wenn ein Name in `type_map` nicht
+voll qualifiziert ist. Namen werden beim Start gegen das Schema geprüft und
+auf den kanonischen `full_name()` normalisiert.
+
+Beispiel `etc/typed.ini`:
+
+```ini
+[record]
+listen = 0.0.0.0:5000
+out = /data/recordings
+proto = /data/proto/sample.proto
+proto_package = demo
+framing = typed-length-le
+type_map = 0=VersionInformation
+type_map = 1=TestRecord
+type_map = 2=Nested
+
+[json]
+json = true
+```
+
+Im Container:
+
+```bash
+docker compose run --rm --service-ports protorecprep \
+  record --config etc/typed.ini
+```
+
+Unbekannte Typ-IDs brechen die Verbindung nicht ab. Sie erscheinen im
+JSONL-Sidecar als `unparsed` mit `type_id`, die Binäraufnahme bleibt
+byte-genau (inklusive Header) und damit replayfähig:
+
+```json
+{"seq":3,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
+ "unparsed":true,"reason":"unknown message type id 7","type_id":7}
+```
+
+Bekannte Typen werden mit lesbarem Namen und ID ausgegeben:
+
+```json
+{"seq":2,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
+ "type":"demo.TestRecord","type_id":1,"message":{"seq":"1","name":"hello"}}
+```
+
+Die vollständige Zuordnung steht zusätzlich in `meta.json` unter `type_map`;
+`proto_package` und der Modus (`framing`) sind dort ebenfalls vermerkt.
+
+`--filter` gibt es nicht mehr: Es werden immer alle Frames aufgezeichnet.
+`--message-type` ist mit Typed-Framing ungültig, weil der Typ pro Frame aus
+dem Header kommt. Ausgehende `--send-*`-Nachrichten verwenden die Rückrichtung
+der `type_map` (Message-Name → ID).
+
 ## Verifikation
 
 ```bash

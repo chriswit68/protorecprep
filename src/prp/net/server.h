@@ -23,7 +23,7 @@ struct SendSpec {
   bool enabled = false;
   std::string type_name;
   std::string json_content;
-  std::string framed_bytes;  // serialized message incl. varint length prefix
+  std::string framed_bytes;  // serialized message incl. the active framing header
   std::chrono::milliseconds once_after{0};
   bool has_once_after = false;
   std::chrono::milliseconds every{0};
@@ -36,9 +36,6 @@ struct ServerConfig {
   uint16_t listen_port = 5000;
   rec::Framing framing = rec::Framing::VarintLength;
   std::string default_type_name;
-  // If non-empty, only messages whose type (inbound: default_type_name,
-  // outbound: send.type_name) is listed are captured.
-  std::vector<std::string> type_filter;
   size_t recv_buffer = 256 * 1024;
   size_t max_frame = 16 * 1024 * 1024;
   size_t max_connections = 1024;

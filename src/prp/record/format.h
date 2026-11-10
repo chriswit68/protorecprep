@@ -19,7 +19,7 @@ inline constexpr uint32_t kMaxRecordPayload = 64u * 1024u * 1024u;
 inline constexpr size_t kFileHeaderFixedSize = 76;
 inline constexpr size_t kRecordPrefixSize = 9;
 
-enum class Framing : uint8_t { Raw = 0, VarintLength = 1 };
+enum class Framing : uint8_t { Raw = 0, VarintLength = 1, TypedLengthLE = 2 };
 
 const char* framing_name(Framing framing);
 bool parse_framing(std::string_view text, Framing& out);

@@ -24,15 +24,6 @@ namespace asio = boost::asio;
 using asio::ip::tcp;
 using ErrorCode = boost::system::error_code;
 
-namespace {
-
-bool in_type_filter(const std::vector<std::string>& filter, const std::string& type_name) {
-  if (type_name.empty()) return false;
-  return std::find(filter.begin(), filter.end(), type_name) != filter.end();
-}
-
-}  // namespace
-
 class Session : public std::enable_shared_from_this<Session> {
  public:
   Session(asio::io_context& io, tcp::socket socket, uint32_t id, Server& server)
@@ -47,23 +38,11 @@ class Session : public std::enable_shared_from_this<Session> {
         every_timer_(strand_),
         forward_watchdog_(strand_) {
     const ServerConfig& config = server_.config();
-    const bool passthrough = config.forward.enabled;
-    const std::string& outbound_type =
-        config.send.enabled ? config.send.type_name : config.default_type_name;
-    if (!config.type_filter.empty()) {
-      record_inbound_ = in_type_filter(config.type_filter, config.default_type_name);
-      record_outbound_ = passthrough ? true : in_type_filter(config.type_filter, outbound_type);
-      open_type_name_ = record_inbound_ ? config.default_type_name : outbound_type;
-    } else {
-      open_type_name_ = config.default_type_name.empty() && config.send.enabled
-                            ? config.send.type_name
-                            : config.default_type_name;
-    }
-    if (passthrough) {
-      // Responses are always captured and reuse --message-type. The filter only
-      // applies to inbound client data.
-      record_outbound_ = true;
-      open_type_name_ = config.default_type_name;
+    // In typed framing the message type comes from each frame header, so the
+    // stream itself has no single type.
+    if (config.framing != rec::Framing::TypedLengthLE) {
+      open_type_name_ = !config.default_type_name.empty() ? config.default_type_name
+                                                          : config.send.type_name;
     }
     if (config.forward.enabled) {
       forwarder_ = std::make_shared<SessionForwarder>(strand_, config.forward);
@@ -117,16 +96,7 @@ class Session : public std::enable_shared_from_this<Session> {
     return ep.address().to_string() + ":" + std::to_string(ep.port());
   }
 
-  bool should_record(const CaptureItem& item) const {
-    if (item.kind == ItemKind::StreamOpen || item.kind == ItemKind::StreamClose) {
-      // Keep stream metadata as long as at least one direction is captured.
-      return record_inbound_ || record_outbound_;
-    }
-    return item.dir == Direction::Out ? record_outbound_ : record_inbound_;
-  }
-
   void submit(const ItemPtr& item) {
-    if (!should_record(*item)) return;
     const PushResult result = server_.recorder().submit(item);
     if (server_.json()) server_.json()->submit(item);
     if (result == PushResult::Closed) {
@@ -168,7 +138,7 @@ class Session : public std::enable_shared_from_this<Session> {
 
     // Capture first: even bytes that violate framing must be preserved so the
     // recording stays a faithful byte stream.
-    if (record_inbound_) {
+    {
       std::vector<uint8_t> bytes(read_buffer_.begin(),
                                  read_buffer_.begin() + static_cast<std::ptrdiff_t>(n));
       submit(make_data(id_, Direction::In, now_wall_ns(), std::move(bytes),
@@ -176,9 +146,8 @@ class Session : public std::enable_shared_from_this<Session> {
     }
     if (closing_) return;
 
-    // Forward the raw inbound bytes before framing validation. Forwarding is
-    // independent of the recording filter and never includes locally generated
-    // outbound messages.
+    // Forward the raw inbound bytes before framing validation. Forwarding never
+    // includes locally generated outbound messages.
     if (forwarder_ && !forwarder_->failed() && !forwarder_->closed()) {
       std::vector<uint8_t> bytes(read_buffer_.begin(),
                                  read_buffer_.begin() + static_cast<std::ptrdiff_t>(n));
@@ -262,7 +231,7 @@ class Session : public std::enable_shared_from_this<Session> {
     }
 
     ++sent_count_;
-    if (record_outbound_) {
+    {
       std::vector<uint8_t> copy(spec.framed_bytes.begin(), spec.framed_bytes.end());
       submit(make_data(id_, Direction::Out, now_wall_ns(), std::move(copy), spec.type_name));
       if (closing_) return;
@@ -316,10 +285,8 @@ class Session : public std::enable_shared_from_this<Session> {
     std::string queued(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     write_queue_bytes_ += bytes.size();
     write_queue_.push_back(std::move(queued));
-    if (record_outbound_) {
-      submit(make_data(id_, Direction::Out, now_wall_ns(), std::move(bytes),
-                       server_.config().default_type_name));
-    }
+    submit(make_data(id_, Direction::Out, now_wall_ns(), std::move(bytes),
+                     server_.config().default_type_name));
     if (closing_) return;
     do_write();
 
@@ -422,8 +389,6 @@ class Session : public std::enable_shared_from_this<Session> {
   bool write_in_progress_ = false;
   bool closing_ = false;
   bool started_ = false;
-  bool record_inbound_ = true;
-  bool record_outbound_ = true;
   std::string open_type_name_;
   int64_t opened_ns_ = 0;
   uint64_t sent_count_ = 0;

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -23,6 +24,8 @@ struct JsonWriterConfig {
   fs::path output_path;  // events.jsonl
   const Schema* schema = nullptr;
   std::string default_type_name;
+  std::string proto_package;                 // fallback prefix for type_map names
+  std::map<uint32_t, std::string> type_map;  // typed framing: id -> message name
   rec::Framing framing = rec::Framing::VarintLength;
   size_t max_queue_bytes = 64ull * 1024 * 1024;
   size_t max_frame = 16ull * 1024 * 1024;
@@ -79,9 +82,10 @@ class JsonWriter {
   void flush_buffer(bool force);
   void emit_event_prefix(const char* event, uint32_t stream_id, int64_t ts_ns);
   void emit_message(uint32_t stream_id, Direction dir, int64_t ts_ns, std::string_view type_name,
-                    const google::protobuf::Message& message);
+                    const google::protobuf::Message& message, uint32_t type_id = 0,
+                    bool has_type = false);
   void emit_unparsed(uint32_t stream_id, Direction dir, int64_t ts_ns, std::string_view reason,
-                     const uint8_t* bytes, size_t len);
+                     const uint8_t* bytes, size_t len, uint32_t type_id = 0, bool has_type = false);
   void handle_open(const CaptureItem& item);
   void handle_data(const CaptureItem& item);
   void handle_close(const CaptureItem& item);

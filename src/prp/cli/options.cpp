@@ -137,23 +137,63 @@ bool load_ini_config(const fs::path& path, std::vector<std::string>& args, std::
   return true;
 }
 
-bool append_type_filter(std::string_view text, std::vector<std::string>& out, std::string& err) {
-  size_t start = 0;
-  while (true) {
-    const size_t comma = text.find(',', start);
-    const size_t end = comma == std::string_view::npos ? text.size() : comma;
-    std::string name(text.substr(start, end - start));
-    const size_t first = name.find_first_not_of(" \t\r\n");
-    const size_t last = name.find_last_not_of(" \t\r\n");
-    if (first == std::string::npos) {
-      err = "empty message type in --filter";
+bool parse_type_id(std::string_view raw, uint32_t& out) {
+  std::string text = trim(raw);
+  int base = 10;
+  if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+    base = 16;
+    text.erase(0, 2);
+  }
+  if (text.empty()) return false;
+  uint64_t value = 0;
+  for (char c : text) {
+    uint64_t digit = 0;
+    if (c >= '0' && c <= '9') {
+      digit = static_cast<uint64_t>(c - '0');
+    } else if (base == 16 && c >= 'a' && c <= 'f') {
+      digit = static_cast<uint64_t>(c - 'a' + 10);
+    } else if (base == 16 && c >= 'A' && c <= 'F') {
+      digit = static_cast<uint64_t>(c - 'A' + 10);
+    } else {
       return false;
     }
-    name = name.substr(first, last - first + 1);
-    if (std::find(out.begin(), out.end(), name) == out.end()) out.push_back(std::move(name));
-    if (comma == std::string_view::npos) return true;
-    start = comma + 1;
+    value = value * static_cast<uint64_t>(base) + digit;
+    if (value > 0xFFFFFFFFull) return false;
   }
+  out = static_cast<uint32_t>(value);
+  return true;
+}
+
+bool append_type_map(std::string_view text, std::map<uint32_t, std::string>& out, std::string& err) {
+  const size_t eq = text.find('=');
+  if (eq == std::string_view::npos) {
+    err = "invalid --type-map value (expected <id>=<message>): " + std::string(text);
+    return false;
+  }
+  const std::string id_text = trim(text.substr(0, eq));
+  const std::string name = trim(text.substr(eq + 1));
+  uint32_t id = 0;
+  if (!parse_type_id(id_text, id)) {
+    err = "invalid message type id in --type-map (expected decimal or 0x hex): " + id_text;
+    return false;
+  }
+  if (name.empty()) {
+    err = "empty message name in --type-map for id " + std::to_string(id);
+    return false;
+  }
+  if (out.find(id) != out.end()) {
+    err = "duplicate message type id " + std::to_string(id) + " in --type-map";
+    return false;
+  }
+  for (const auto& [existing_id, existing_name] : out) {
+    if (existing_name == name) {
+      err = "duplicate message name '" + name + "' in --type-map (ids " +
+            std::to_string(existing_id) + " and " + std::to_string(id) + ")";
+      return false;
+    }
+  }
+  out.emplace(id, name);
+  return true;
 }
 
 bool parse_log_level(std::string_view text, LogLevel& out) {
@@ -442,17 +482,19 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       std::string text;
       if (!need_value(text)) return false;
       out.proto_paths.push_back(text);
+    } else if (key == "--proto-package") {
+      if (!need_value(out.proto_package)) return false;
     } else if (key == "--message-type") {
       if (!need_value(out.message_type)) return false;
-    } else if (key == "--filter" || key == "--filter-type") {
+    } else if (key == "--type-map") {
       std::string text;
       if (!need_value(text)) return false;
-      if (!append_type_filter(text, out.type_filter, err)) return false;
+      if (!append_type_map(text, out.type_map, err)) return false;
     } else if (key == "--framing") {
       std::string text;
       if (!need_value(text)) return false;
       if (!rec::parse_framing(text, out.framing)) {
-        err = "invalid --framing value (raw|varint-length): " + text;
+        err = "invalid --framing value (raw|varint-length|typed-length-le): " + text;
         return false;
       }
     } else if (key == "--json") {
@@ -612,8 +654,20 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       err = "--json requires --proto <file.proto>";
       return false;
     }
-    if (!out.type_filter.empty() && out.message_type.empty()) {
-      err = "--filter requires --message-type (the type of inbound streams)";
+    if (out.framing == rec::Framing::TypedLengthLE && !out.message_type.empty()) {
+      err = "--message-type is not allowed with typed framing (the type comes from each frame header)";
+      return false;
+    }
+    if (!out.type_map.empty() && out.proto_file.empty()) {
+      err = "--type-map requires --proto <file.proto>";
+      return false;
+    }
+    if (!out.proto_package.empty() && out.proto_file.empty()) {
+      err = "--proto-package requires --proto <file.proto>";
+      return false;
+    }
+    if (out.json_enabled && out.framing == rec::Framing::TypedLengthLE && out.type_map.empty()) {
+      err = "--json with typed framing requires at least one --type-map entry";
       return false;
     }
     if (out.command == "passthrough" &&
@@ -776,9 +830,10 @@ void print_help() {
       "  --flat                      Write into --out directly instead of a session subdirectory\n"
       "  --proto <file.proto>        Schema for JSON conversion and outbound messages\n"
       "  --proto-path <dir>          Additional import path (repeatable)\n"
-      "  --message-type <pkg.Msg>    Message type for inbound streams\n"
-      "  --filter <pkg.Msg[,..]>     Record only messages of these types (repeatable)\n"
-      "  --framing <raw|varint-length>  Wire framing (default varint-length)\n"
+      "  --proto-package <pkg>       Package prefix for unqualified type-map names\n"
+      "  --message-type <pkg.Msg>    Message type for inbound streams (not with typed framing)\n"
+      "  --type-map <id>=<pkg.Msg>   Message type id for typed framing (repeatable)\n"
+      "  --framing <mode>            raw|varint-length|typed-length-le (default varint-length)\n"
       "  --json[=jsonl|off]          Enable JSONL sidecar (requires --proto)\n"
       "  --json-file <path>          JSONL data file (default <session>/events.jsonl)\n"
       "  --json-print-defaults       Include fields with default values\n"
@@ -832,8 +887,8 @@ void print_help() {
       "  --io-threads <n>            IO worker threads (default auto)\n"
       "\n"
       "  Target responses are forwarded live to the client and are always\n"
-      "  recorded (--filter does not apply to them). --message-type also\n"
-      "  types the response channel; --send-* is not supported in passthrough.\n"
+      "  recorded. --message-type also types the response channel; --send-*\n"
+      "  is not supported in passthrough.\n"
       "\n"
       "COMMON OPTIONS\n"
       "  --quiet | --verbose         Log level shortcuts\n"
@@ -844,7 +899,7 @@ void print_help() {
       "CONFIG FILE\n"
       "  --config <file.ini> reads the same options from an INI file before the\n"
       "  command line, so explicit CLI values override config values. Repeatable\n"
-      "  options (--filter, --proto-path) accumulate. Keys are long option names\n"
+      "  options (--type-map, --proto-path) accumulate. Keys are long option names\n"
       "  without '--'; '-' and '_' are interchangeable, sections are ignored.\n"
       "  Relative paths (including proto) resolve against the working directory.\n"
       "  Example:\n"
