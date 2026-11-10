@@ -40,6 +40,7 @@ add_library(prp_core
   src/prp/net/framer.cpp
   src/prp/net/server.cpp
   src/prp/net/client.cpp
+  src/prp/net/forwarder.cpp
   src/prp/cli/options.cpp
   src/prp/app/record_app.cpp
   src/prp/replay/replay_app.cpp

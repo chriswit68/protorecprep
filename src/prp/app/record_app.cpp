@@ -49,11 +49,13 @@ std::string uuid_hex(const std::array<uint8_t, 16>& uuid) {  static constexpr ch
 }
 
 std::string meta_json(const Options& options, const Schema& schema, const fs::path& session_dir,
-                      const fs::path& json_path, const std::string& session_id, const SendSpec& send) {
+                      const fs::path& json_path, const std::string& session_id, const SendSpec& send,
+                      const ForwardConfig& forward) {
   const char* framing = rec::framing_name(options.framing);
   std::string json = "{\n";
   json += "  \"tool\": \"protorecprep\",\n";
   json += "  \"version\": \"" PRP_VERSION "\",\n";
+  json += "  \"mode\": \"" + json_escape(options.command) + "\",\n";
   json += "  \"session_id\": \"" + json_escape(session_id) + "\",\n";
   json += "  \"started\": \"" + iso8601_now() + "\",\n";
   json += "  \"host\": \"" + json_escape(hostname()) + "\",\n";
@@ -91,7 +93,18 @@ std::string meta_json(const Options& options, const Schema& schema, const fs::pa
     json += "\"every_ms\": " + std::to_string(send.has_every ? send.every.count() : 0) + ", ";
     json += "\"count\": " + std::to_string(send.count);
   }
-  json += "}\n";
+  json += "},\n";
+  json += "  \"forward\": {\n";
+  json += "    \"enabled\": " + std::string(forward.enabled ? "true" : "false") + ",\n";
+  json += "    \"target\": \"" +
+          json_escape(forward.enabled ? forward.host + ":" + std::to_string(forward.port) : "") +
+          "\",\n";
+  json += "    \"queue_bytes\": " + std::to_string(forward.queue_limit) + ",\n";
+  json += "    \"reconnect\": " + std::string(forward.reconnect ? "true" : "false") + ",\n";
+  json += "    \"connect_timeout_ms\": " + std::to_string(forward.connect_timeout.count()) + ",\n";
+  json += "    \"connect_retries\": " + std::to_string(forward.connect_retries) + ",\n";
+  json += "    \"retry_interval_ms\": " + std::to_string(forward.retry_interval.count()) + "\n";
+  json += "  }\n";
   json += "}\n";
   return json;
 }
@@ -119,7 +132,8 @@ void write_json_summary(const JsonWriter& writer, const fs::path& dir) {
 
 }  // namespace
 
-int run_record(const Options& options, std::string& err) {
+int run_server_mode(const Options& options, std::string& err) {
+  const bool passthrough = options.command == "passthrough";
   const std::string session_id = random_hex(16);
 
   auto fail = [&err](std::string message) {
@@ -202,10 +216,17 @@ int run_record(const Options& options, std::string& err) {
   if (!options.type_filter.empty()) {
     if (!filter_has(options.type_filter, options.message_type) &&
         !(send.enabled && filter_has(options.type_filter, send.type_name))) {
-      log_printf(LogLevel::Warn,
-                 "type filter matches neither inbound '%s' nor outbound '%s'; "
-                 "nothing will be recorded",
-                 options.message_type.c_str(), send.type_name.c_str());
+      if (passthrough) {
+        log_printf(LogLevel::Warn,
+                   "type filter does not match inbound '%s'; inbound will not be recorded "
+                   "(target responses are always recorded)",
+                   options.message_type.c_str());
+      } else {
+        log_printf(LogLevel::Warn,
+                   "type filter matches neither inbound '%s' nor outbound '%s'; "
+                   "nothing will be recorded",
+                   options.message_type.c_str(), send.type_name.c_str());
+      }
     }
     std::string joined;
     for (const std::string& type : options.type_filter) {
@@ -268,10 +289,21 @@ int run_record(const Options& options, std::string& err) {
   server_config.max_connections = options.max_connections;
   server_config.idle_timeout = options.idle_timeout;
   server_config.send = send;
+  if (passthrough) {
+    server_config.forward.enabled = true;
+    server_config.forward.host = options.target_host;
+    server_config.forward.port = options.target_port;
+    server_config.forward.connect_timeout = options.connect_timeout;
+    server_config.forward.retry_interval = options.retry_interval;
+    server_config.forward.connect_retries = options.connect_retries;
+    server_config.forward.reconnect = options.reconnect;
+    server_config.forward.queue_limit = options.forward_queue;
+  }
 
   Server server(io, server_config, recorder, json.get());
 
-  const std::string meta = meta_json(options, schema, session_dir, json_path, session_id, send);
+  const std::string meta = meta_json(options, schema, session_dir, json_path, session_id, send,
+                                     server_config.forward);
   if (!write_file_atomic(session_dir / "meta.json", meta, err)) {
     log_error("could not write meta.json: " + err);
     return 2;
@@ -317,7 +349,13 @@ int run_record(const Options& options, std::string& err) {
   });
 
   server.start();
-  log_printf(LogLevel::Info, "recording to %s", session_dir.string().c_str());
+  if (passthrough) {
+    log_printf(LogLevel::Info, "recording to %s, forwarding inbound data to %s:%u",
+               session_dir.string().c_str(), options.target_host.c_str(),
+               static_cast<unsigned>(options.target_port));
+  } else {
+    log_printf(LogLevel::Info, "recording to %s", session_dir.string().c_str());
+  }
 
   std::vector<std::thread> io_threads;
   for (unsigned i = 1; i < options.io_threads; ++i) {
@@ -332,9 +370,27 @@ int run_record(const Options& options, std::string& err) {
     log_error("recording finished with errors: " + err);
     return 1;
   }
-  log_printf(LogLevel::Info, "recording finished cleanly (%llu records, %s data)",
-             static_cast<unsigned long long>(stats.records), format_bytes(stats.data_bytes).c_str());
+  if (passthrough) {
+    const ForwardStats forward = server.forward_stats();
+    log_printf(LogLevel::Info,
+               "recording finished cleanly (%llu records, %s data); forwarded %llu stream(s), "
+               "%s to target / %s responses to clients over %llu connection(s), %llu failure(s)",
+               static_cast<unsigned long long>(stats.records), format_bytes(stats.data_bytes).c_str(),
+               static_cast<unsigned long long>(forward.streams), format_bytes(forward.bytes).c_str(),
+               format_bytes(forward.response_bytes).c_str(),
+               static_cast<unsigned long long>(forward.connects),
+               static_cast<unsigned long long>(forward.failures));
+  } else {
+    log_printf(LogLevel::Info, "recording finished cleanly (%llu records, %s data)",
+               static_cast<unsigned long long>(stats.records), format_bytes(stats.data_bytes).c_str());
+  }
   return 0;
+}
+
+int run_record(const Options& options, std::string& err) { return run_server_mode(options, err); }
+
+int run_passthrough(const Options& options, std::string& err) {
+  return run_server_mode(options, err);
 }
 
 int run_inspect(const Options& options, std::string& err) {

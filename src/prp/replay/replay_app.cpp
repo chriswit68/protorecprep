@@ -419,7 +419,7 @@ class ReplayRunner {
     }
 
     const unsigned reconnects = reconnect_counts_[stream_id];
-    if (options_.replay_reconnect && client->connects() > 0 && reconnects < kMaxReconnects) {
+    if (options_.reconnect && client->connects() > 0 && reconnects < kMaxReconnects) {
       reconnect_counts_[stream_id] = reconnects + 1;
       log_printf(LogLevel::Warn, "stream %u lost connection (%s), reconnecting (%u/%u)", stream_id,
                  message.c_str(), reconnects + 1, kMaxReconnects);

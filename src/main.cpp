@@ -27,6 +27,11 @@ int main(int argc, char** argv) {
   if (options.command == "record") {
     return prp::run_record(options, err);
   }
+  if (options.command == "passthrough") {
+    const int rc = prp::run_passthrough(options, err);
+    if (rc != 0 && !err.empty()) std::fprintf(stderr, "error: %s\n", err.c_str());
+    return rc;
+  }
   if (options.command == "replay") {
     const int rc = prp::run_replay(options, err);
     if (rc != 0 && !err.empty()) std::fprintf(stderr, "error: %s\n", err.c_str());

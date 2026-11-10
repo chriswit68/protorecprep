@@ -5,7 +5,9 @@
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/connect.hpp>
+#include <boost/asio/error.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 
 #include "prp/util/log.h"
@@ -21,12 +23,14 @@ ClientConnection::ClientConnection(asio::any_io_executor executor, ClientConfig 
       resolver_(executor_),
       socket_(executor_),
       connect_timer_(executor_),
-      retry_timer_(executor_) {}
+      retry_timer_(executor_),
+      read_buffer_(config_.read_buffer < 4096 ? 4096 : config_.read_buffer) {}
 
 void ClientConnection::start() {
   if (started_ || closed_) return;
   started_ = true;
   failed_ = false;
+  io_error_reported_ = false;
   attempts_left_ = config_.connect_retries;
   do_connect();
 }
@@ -36,6 +40,7 @@ void ClientConnection::restart() {
   // established. A cleanly closed connection must be replaced by the caller.
   if (!started_ || closed_ || connected_) return;
   failed_ = false;
+  io_error_reported_ = false;
   ++attempt_id_;  // invalidate callbacks from the previous attempt
   ErrorCode ignored;
   connect_timer_.cancel();
@@ -74,10 +79,29 @@ void ClientConnection::abort() {
   socket_.close(ignored);
   connected_ = false;
   writing_ = false;
+  reading_ = false;
+  read_requested_ = false;
+  read_paused_ = false;
   queue_.clear();
   front_offset_ = 0;
   queued_bytes_ = 0;
   finish_close();
+}
+
+void ClientConnection::start_reading() {
+  if (closed_) return;
+  read_requested_ = true;
+  if (connected_) do_read();
+}
+
+void ClientConnection::stop_reading() { read_requested_ = false; }
+
+void ClientConnection::pause_reads() { read_paused_ = true; }
+
+void ClientConnection::resume_reads() {
+  if (!read_paused_) return;
+  read_paused_ = false;
+  if (read_requested_ && connected_ && !closed_) do_read();
 }
 
 void ClientConnection::do_connect() {
@@ -126,6 +150,7 @@ void ClientConnection::do_connect() {
               self->connect_timer_.cancel();
               self->connected_ = true;
               self->failed_ = false;
+              self->io_error_reported_ = false;
               ++self->connects_;
               ErrorCode opt_ec;
               self->socket_.set_option(tcp::no_delay(true), opt_ec);
@@ -134,6 +159,7 @@ void ClientConnection::do_connect() {
                          static_cast<unsigned>(self->config_.port));
               self->notify(self->ready_cb_);
               self->do_write();
+              if (self->read_requested_) self->do_read();
             }));
       }));
 }
@@ -197,12 +223,8 @@ void ClientConnection::on_write(const ErrorCode& ec, size_t transferred) {
   }
 
   if (ec) {
-    connected_ = false;
-    failed_ = true;
-    ErrorCode ignored;
-    socket_.close(ignored);
-    notify_error("write to " + config_.host + ":" + std::to_string(config_.port) +
-                 " failed: " + ec.message());
+    report_io_error("write to " + config_.host + ":" + std::to_string(config_.port) +
+                    " failed: " + ec.message());
     return;
   }
 
@@ -214,11 +236,64 @@ void ClientConnection::on_write(const ErrorCode& ec, size_t transferred) {
   do_write();
 }
 
+void ClientConnection::do_read() {
+  if (closed_ || !connected_ || reading_ || !read_requested_ || read_paused_) return;
+  reading_ = true;
+  auto self = shared_from_this();
+  socket_.async_read_some(asio::buffer(read_buffer_),
+                          asio::bind_executor(executor_, [self](const ErrorCode& ec, size_t n) {
+                            self->on_read(ec, n);
+                          }));
+}
+
+void ClientConnection::on_read(const ErrorCode& ec, size_t transferred) {
+  reading_ = false;
+  if (closed_) return;
+
+  if (ec) {
+    if (ec == asio::error::operation_aborted) {
+      // A restart closes the socket; re-arm on the new connection if needed.
+      if (read_requested_ && connected_ && !read_paused_) do_read();
+      return;
+    }
+    report_io_error("read from " + config_.host + ":" + std::to_string(config_.port) +
+                    " failed: " + ec.message());
+    return;
+  }
+
+  if (transferred > 0) {
+    bytes_read_ += transferred;
+    if (data_cb_) {
+      std::vector<uint8_t> bytes(
+          read_buffer_.begin(),
+          read_buffer_.begin() + static_cast<std::ptrdiff_t>(transferred));
+      data_cb_(std::move(bytes));
+      if (closed_) return;
+    }
+  }
+
+  if (!read_requested_ || read_paused_) return;
+  do_read();
+}
+
+void ClientConnection::report_io_error(const std::string& message) {
+  if (closed_ || io_error_reported_) return;
+  io_error_reported_ = true;
+  failed_ = true;
+  connected_ = false;
+  ErrorCode ignored;
+  socket_.close(ignored);
+  notify_error(message);
+}
+
 void ClientConnection::finish_close() {
   if (closed_) return;
   closed_ = true;
   connected_ = false;
   writing_ = false;
+  reading_ = false;
+  read_requested_ = false;
+  read_paused_ = false;
   ++attempt_id_;  // ignore late resolve/connect/timeout callbacks
   ErrorCode ignored;
   connect_timer_.cancel();

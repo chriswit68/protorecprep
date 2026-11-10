@@ -15,6 +15,11 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/replay_test.py
             $<TARGET_FILE:protorecprep> ${CMAKE_CURRENT_SOURCE_DIR}/../proto/sample.proto)
   set_tests_properties(replay PROPERTIES TIMEOUT 120)
+
+  add_test(NAME passthrough
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/passthrough_test.py
+            $<TARGET_FILE:protorecprep> ${CMAKE_CURRENT_SOURCE_DIR}/../proto/sample.proto)
+  set_tests_properties(passthrough PROPERTIES TIMEOUT 180)
 endif()
 
 # Work around protobuf/absl crashing under ASan/TSan (upstream issue with the
@@ -26,6 +31,8 @@ if(PRP_ASAN OR PRP_TSAN)
     set_tests_properties(integration PROPERTIES
       ENVIRONMENT "PRP_SKIP_PROTO_TESTS=1;ASAN_OPTIONS=detect_leaks=0")
     set_tests_properties(replay PROPERTIES
+      ENVIRONMENT "PRP_SKIP_PROTO_TESTS=1;ASAN_OPTIONS=detect_leaks=0")
+    set_tests_properties(passthrough PROPERTIES
       ENVIRONMENT "PRP_SKIP_PROTO_TESTS=1;ASAN_OPTIONS=detect_leaks=0")
   endif()
 endif()

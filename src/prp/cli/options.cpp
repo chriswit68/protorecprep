@@ -324,8 +324,10 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
     out.version = true;
     return true;
   }
-  if (first != "record" && first != "inspect" && first != "replay") {
-    err = "unknown command '" + first + "' (expected 'record', 'replay' or 'inspect')";
+  if (first != "record" && first != "inspect" && first != "replay" && first != "passthrough") {
+    err =
+        "unknown command '" + first +
+        "' (expected 'record', 'replay', 'passthrough' or 'inspect')";
     return false;
   }
   out.command = first;
@@ -558,7 +560,7 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
         return false;
       }
     } else if (key == "--reconnect") {
-      out.replay_reconnect = true;
+      out.reconnect = true;
     } else if (key == "--connect-timeout") {
       if (!need_duration(out.connect_timeout)) return false;
     } else if (key == "--connect-retries") {
@@ -567,6 +569,14 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       if (!need_duration(out.retry_interval)) return false;
     } else if (key == "--max-gap") {
       if (!need_duration(out.max_gap)) return false;
+    } else if (key == "--forward-queue") {
+      size_t queue_bytes = 0;
+      if (!need_size(queue_bytes)) return false;
+      if (queue_bytes < 1024 * 1024 || queue_bytes > 1024ull * 1024 * 1024) {
+        err = "--forward-queue must be between 1 MiB and 1 GiB";
+        return false;
+      }
+      out.forward_queue = queue_bytes;
     } else if (key == "--strict") {
       out.strict = true;
     } else if (key == "--truncate") {
@@ -593,9 +603,9 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
 
   if (out.help) return true;
 
-  if (out.command == "record") {
+  if (out.command == "record" || out.command == "passthrough") {
     if (out.out_dir.empty()) {
-      err = "record requires --out <directory>";
+      err = out.command + " requires --out <directory>";
       return false;
     }
     if (out.json_enabled && out.proto_file.empty()) {
@@ -604,6 +614,12 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
     }
     if (!out.type_filter.empty() && out.message_type.empty()) {
       err = "--filter requires --message-type (the type of inbound streams)";
+      return false;
+    }
+    if (out.command == "passthrough" &&
+        (out.send.enabled || !out.send.content.empty() || out.send.has_once || out.send.has_every ||
+         out.send.count > 0)) {
+      err = "--send-* is not supported by passthrough (clients receive live target responses, not scripted messages)";
       return false;
     }
     if (out.send.enabled) {
@@ -635,6 +651,61 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
     if (out.max_connections == 0) {
       err = "--max-connections must be > 0";
       return false;
+    }
+    if (out.command == "passthrough") {
+      if (out.target_host.empty() || out.target_port == 0) {
+        err = "passthrough requires --target <host:port>";
+        return false;
+      }
+      if (!out.proto_paths.empty() && out.proto_file.empty()) {
+        err = "--proto-path requires --proto";
+        return false;
+      }
+      if (!out.input_file.empty() || !out.input_dir.empty()) {
+        err = "passthrough does not use --rec or --dir";
+        return false;
+      }
+      if (out.truncate_damaged) {
+        err = "--truncate is only valid for inspect";
+        return false;
+      }
+      if (out.replay_speed != 1.0) {
+        err = "--speed is only valid for replay";
+        return false;
+      }
+      if (out.replay_direction != ReplayDirection::In) {
+        err = "--direction is only valid for replay";
+        return false;
+      }
+      if (out.max_gap.count() != 0) {
+        err = "--max-gap is only valid for replay";
+        return false;
+      }
+      if (out.strict) {
+        err = "--strict is only valid for replay";
+        return false;
+      }
+      if (out.connect_retries == 0) {
+        err = "--connect-retries must be > 0";
+        return false;
+      }
+      if (out.connect_timeout.count() <= 0) {
+        err = "--connect-timeout must be > 0";
+        return false;
+      }
+      if (out.retry_interval.count() < 0) {
+        err = "--retry-interval must not be negative";
+        return false;
+      }
+      const auto wildcard = [](const std::string& host) {
+        return host.empty() || host == "0.0.0.0" || host == "::" || host == "*";
+      };
+      if (out.target_port == out.listen_port &&
+          (out.target_host == out.listen_host || wildcard(out.target_host) ||
+           wildcard(out.listen_host))) {
+        err = "--target must not point at the passthrough listener itself";
+        return false;
+      }
     }
     set_defaults_for_record(out);
   } else if (out.command == "replay") {
@@ -694,6 +765,7 @@ void print_help() {
       "  protorecprep record [options]\n"
       "  protorecprep replay --rec <capture.pcr> --target <host:port> [options]\n"
       "  protorecprep replay --dir <session-dir> --target <host:port> [options]\n"
+      "  protorecprep passthrough --target <host:port> [record options]\n"
       "  protorecprep inspect --rec <capture.pcr> [--truncate]\n"
       "  protorecprep inspect --dir <session-dir> [--truncate]\n"
       "\n"
@@ -745,6 +817,23 @@ void print_help() {
       "  --max-gap <dur>             Cap idle gaps between records (default off)\n"
       "  --strict                    Treat damaged/inconsistent captures as fatal\n"
       "  --io-threads <n>            IO worker threads (default auto)\n"
+      "\n"
+      "PASSTHROUGH OPTIONS\n"
+      "  All RECORD OPTIONS apply, except --send-* (no scripted client messages).\n"
+      "  --target <host:port>        Destination server (required)\n"
+      "  --forward-queue <size>      Per-stream backlog limit in both directions: inbound\n"
+      "                              forward and response delivery to the client. Reads\n"
+      "                              pause while a backlog is full; nothing is lost.\n"
+      "                              (default 16MiB, 1MiB..1GiB)\n"
+      "  --connect-timeout <dur>     Connect timeout per attempt (default 5s)\n"
+      "  --connect-retries <n>       Total connect attempts (default 5)\n"
+      "  --retry-interval <dur>      Delay between connect attempts (default 1s)\n"
+      "  --reconnect                 Resume after a mid-stream connection loss\n"
+      "  --io-threads <n>            IO worker threads (default auto)\n"
+      "\n"
+      "  Target responses are forwarded live to the client and are always\n"
+      "  recorded (--filter does not apply to them). --message-type also\n"
+      "  types the response channel; --send-* is not supported in passthrough.\n"
       "\n"
       "COMMON OPTIONS\n"
       "  --quiet | --verbose         Log level shortcuts\n"

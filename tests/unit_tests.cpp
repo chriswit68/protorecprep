@@ -278,7 +278,7 @@ void test_replay_options() {
     CHECK_EQ(options.target_port, uint16_t{6000});
     CHECK_EQ(options.replay_speed, 2.5);
     CHECK(options.replay_direction == prp::ReplayDirection::Both);
-    CHECK(options.replay_reconnect);
+    CHECK(options.reconnect);
     CHECK_EQ(options.connect_timeout.count(), int64_t{250});
     CHECK_EQ(options.connect_retries, uint64_t{3});
     CHECK_EQ(options.retry_interval.count(), int64_t{10});
@@ -352,6 +352,104 @@ void test_replay_options() {
     CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--proto-path",
                   "include"},
                  options, err));
+  }
+}
+
+void test_passthrough_options() {
+  auto parse = [](std::vector<std::string> args, prp::Options& out, std::string& err) {
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (std::string& arg : args) argv.push_back(arg.data());
+    return prp::parse_options(static_cast<int>(argv.size()), argv.data(), out, err);
+  };
+
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "127.0.0.1:7000",
+                 "--forward-queue", "2MiB", "--reconnect", "--connect-timeout", "250ms",
+                 "--connect-retries", "3", "--retry-interval", "10ms"},
+                options, err));
+    CHECK_EQ(options.command, std::string("passthrough"));
+    CHECK_EQ(options.target_host, std::string("127.0.0.1"));
+    CHECK_EQ(options.target_port, uint16_t{7000});
+    CHECK_EQ(options.forward_queue, size_t{2} * 1024 * 1024);
+    CHECK(options.reconnect);
+    CHECK_EQ(options.connect_timeout.count(), int64_t{250});
+    CHECK_EQ(options.connect_retries, uint64_t{3});
+    CHECK_EQ(options.retry_interval.count(), int64_t{10});
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1"}, options,
+                err));
+    CHECK_EQ(options.forward_queue, size_t{16} * 1024 * 1024);
+  }
+  {
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out"}, options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--target", "h:1"}, options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--rec",
+                  "a.pcr"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--dir",
+                  "/tmp/session"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1",
+                  "--truncate"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--speed",
+                  "2"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1",
+                  "--direction", "out"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--max-gap",
+                  "1s"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--strict"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--send-type",
+                  "sample.Sample"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1",
+                  "--send-every", "1s"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--send-count",
+                  "5"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "127.0.0.1:5000",
+                  "--listen", "127.0.0.1:5000"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1",
+                  "--forward-queue", "512KiB"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1",
+                  "--forward-queue", "2GiB"},
+                 options, err));
+  }
+  {
+    // INI keys use the long option names without the leading dashes.
+    const auto dir = make_temp_dir("passthrough-config");
+    const auto ini = dir / "passthrough.ini";
+    std::string err;
+    CHECK(prp::write_file_atomic(ini,
+                                 "[passthrough]\n"
+                                 "out = /tmp/out\n"
+                                 "target = 127.0.0.1:7100\n"
+                                 "forward_queue = 3MiB\n"
+                                 "reconnect = true\n"
+                                 "connect_retries = 4\n",
+                                 err));
+    prp::Options options;
+    CHECK(parse({"protorecprep", "passthrough", "--config", ini.string()}, options, err));
+    CHECK_EQ(options.target_port, uint16_t{7100});
+    CHECK_EQ(options.forward_queue, size_t{3} * 1024 * 1024);
+    CHECK(options.reconnect);
+    CHECK_EQ(options.connect_retries, uint64_t{4});
+    std::filesystem::remove_all(dir);
   }
 }
 
@@ -452,7 +550,7 @@ void test_config_file() {
     CHECK_EQ(o.target_port, uint16_t{7777});
     CHECK_EQ(o.replay_speed, 0.0);
     CHECK(o.replay_direction == prp::ReplayDirection::Out);
-    CHECK(o.replay_reconnect);
+    CHECK(o.reconnect);
     CHECK(o.strict);
     CHECK_EQ(o.connect_retries, uint64_t{2});
     CHECK_EQ(o.connect_timeout.count(), int64_t{250});
@@ -469,7 +567,7 @@ void test_config_file() {
                                  err));
     prp::Options o;
     CHECK(parse({"protorecprep", "replay", "--config", replay_ini.string()}, o, err));
-    CHECK(!o.replay_reconnect);
+    CHECK(!o.reconnect);
     CHECK(!o.strict);
   }
   std::filesystem::remove_all(dir);
@@ -874,6 +972,7 @@ int main(int argc, char** argv) {
   test_filter_options();
   test_chunk_and_json_options();
   test_replay_options();
+  test_passthrough_options();
   test_config_file();
   test_framer();
   test_item_queue();

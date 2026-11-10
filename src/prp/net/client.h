@@ -25,18 +25,24 @@ struct ClientConfig {
   // Soft bound for queued bytes. The replay scheduler applies backpressure
   // before this limit is reached, so it normally never trips.
   size_t max_queue_bytes = 256ull * 1024 * 1024;
+  // Buffer size for the optional read direction (passthrough responses).
+  size_t read_buffer = 64ull * 1024;
 };
 
-// Asynchronous TCP client used by the replay mode.
+// Asynchronous TCP client used by replay mode and by the passthrough forwarder.
 //
-// Thread-safety: the constructor takes the executor that runs the replay
-// scheduler (a strand). All public methods must be called from that executor,
+// Reading is opt-in: replay never calls start_reading(), so the write-only
+// behavior is unchanged. Passthrough enables reads to receive target responses.
+//
+// Thread-safety: the constructor takes the executor that runs the owning
+// component's strand. All public methods must be called from that executor,
 // and all callbacks are posted back to it. This makes the client safe to use
 // with multiple io_context threads without additional locking.
 class ClientConnection : public std::enable_shared_from_this<ClientConnection> {
  public:
   using Callback = std::function<void()>;
   using ErrorCallback = std::function<void(const std::string&)>;
+  using DataCallback = std::function<void(std::vector<uint8_t>)>;
 
   ClientConnection(boost::asio::any_io_executor executor, ClientConfig config);
 
@@ -53,18 +59,27 @@ class ClientConnection : public std::enable_shared_from_this<ClientConnection> {
   // Drops the connection and any queued data immediately.
   void abort();
 
+  // Optional read direction. Data is delivered on the connection's executor.
+  void start_reading();
+  void stop_reading();
+  void pause_reads();
+  void resume_reads();
+
   void set_ready_callback(Callback callback) { ready_cb_ = std::move(callback); }
   void set_drained_callback(Callback callback) { drained_cb_ = std::move(callback); }
   void set_closed_callback(Callback callback) { closed_cb_ = std::move(callback); }
   void set_error_callback(ErrorCallback callback) { error_cb_ = std::move(callback); }
+  void set_data_callback(DataCallback callback) { data_cb_ = std::move(callback); }
 
   bool started() const { return started_; }
   bool connected() const { return connected_; }
   bool closing() const { return close_requested_; }
   bool closed() const { return closed_; }
   bool failed() const { return failed_; }
+  bool reads_paused() const { return read_paused_; }
   size_t queued_bytes() const { return queued_bytes_; }
   uint64_t bytes_written() const { return bytes_written_; }
+  uint64_t bytes_read() const { return bytes_read_; }
   uint64_t connects() const { return connects_; }
 
  private:
@@ -75,6 +90,9 @@ class ClientConnection : public std::enable_shared_from_this<ClientConnection> {
   void schedule_retry();
   void do_write();
   void on_write(const boost::system::error_code& ec, size_t transferred);
+  void do_read();
+  void on_read(const boost::system::error_code& ec, size_t transferred);
+  void report_io_error(const std::string& message);
   void finish_close();
   void notify(Callback& callback);
   void notify_error(const std::string& message);
@@ -89,19 +107,26 @@ class ClientConnection : public std::enable_shared_from_this<ClientConnection> {
   std::deque<std::vector<uint8_t>> queue_;
   size_t front_offset_ = 0;
   size_t queued_bytes_ = 0;
+  std::vector<uint8_t> read_buffer_;
 
   Callback ready_cb_;
   Callback drained_cb_;
   Callback closed_cb_;
   ErrorCallback error_cb_;
+  DataCallback data_cb_;
 
   uint64_t attempt_id_ = 0;
   uint64_t attempts_left_ = 0;
   uint64_t connects_ = 0;
   uint64_t bytes_written_ = 0;
+  uint64_t bytes_read_ = 0;
   bool started_ = false;
   bool connected_ = false;
   bool writing_ = false;
+  bool reading_ = false;
+  bool read_requested_ = false;
+  bool read_paused_ = false;
+  bool io_error_reported_ = false;
   bool close_requested_ = false;
   bool closed_ = false;
   bool failed_ = false;

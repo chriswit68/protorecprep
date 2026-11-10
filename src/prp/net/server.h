@@ -13,6 +13,7 @@
 #include <boost/asio/ip/tcp.hpp>
 
 #include "prp/json/json_writer.h"
+#include "prp/net/forwarder.h"
 #include "prp/record/format.h"
 #include "prp/record/recorder.h"
 
@@ -43,6 +44,15 @@ struct ServerConfig {
   size_t max_connections = 1024;
   std::chrono::milliseconds idle_timeout{0};
   SendSpec send;
+  ForwardConfig forward;
+};
+
+struct ForwardStats {
+  uint64_t streams = 0;         // streams that opened a target connection
+  uint64_t bytes = 0;           // bytes written to target servers
+  uint64_t response_bytes = 0;  // bytes received from target servers
+  uint64_t connects = 0;        // successful target connections (incl. reconnects)
+  uint64_t failures = 0;        // streams whose forwarding stopped on error
 };
 
 class Session;
@@ -71,6 +81,11 @@ class Server {
   Recorder& recorder() { return recorder_; }
   JsonWriter* json() { return json_; }
 
+  // Aggregated forwarding statistics (passthrough mode).
+  void note_forward_result(bool started, uint64_t bytes, uint64_t connects, bool failed,
+                           uint64_t response_bytes);
+  ForwardStats forward_stats() const;
+
   void on_session_closed(uint32_t id);
 
  private:
@@ -85,6 +100,11 @@ class Server {
   std::atomic<bool> stopping_{false};
   std::atomic<bool> stopped_fired_{false};
   std::atomic<uint64_t> total_accepted_{0};
+  std::atomic<uint64_t> forward_streams_{0};
+  std::atomic<uint64_t> forward_bytes_{0};
+  std::atomic<uint64_t> forward_response_bytes_{0};
+  std::atomic<uint64_t> forward_connects_{0};
+  std::atomic<uint64_t> forward_failures_{0};
 
   mutable std::mutex mutex_;
   std::map<uint32_t, std::shared_ptr<Session>> sessions_;

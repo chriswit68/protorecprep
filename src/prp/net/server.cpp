@@ -44,23 +44,49 @@ class Session : public std::enable_shared_from_this<Session> {
         validator_(server.config().framing, server.config().max_frame),
         idle_timer_(strand_),
         once_timer_(strand_),
-        every_timer_(strand_) {
+        every_timer_(strand_),
+        forward_watchdog_(strand_) {
     const ServerConfig& config = server_.config();
+    const bool passthrough = config.forward.enabled;
     const std::string& outbound_type =
         config.send.enabled ? config.send.type_name : config.default_type_name;
     if (!config.type_filter.empty()) {
       record_inbound_ = in_type_filter(config.type_filter, config.default_type_name);
-      record_outbound_ = in_type_filter(config.type_filter, outbound_type);
+      record_outbound_ = passthrough ? true : in_type_filter(config.type_filter, outbound_type);
       open_type_name_ = record_inbound_ ? config.default_type_name : outbound_type;
     } else {
       open_type_name_ = config.default_type_name.empty() && config.send.enabled
                             ? config.send.type_name
                             : config.default_type_name;
     }
+    if (passthrough) {
+      // Responses are always captured and reuse --message-type. The filter only
+      // applies to inbound client data.
+      record_outbound_ = true;
+      open_type_name_ = config.default_type_name;
+    }
+    if (config.forward.enabled) {
+      forwarder_ = std::make_shared<SessionForwarder>(strand_, config.forward);
+    }
   }
 
   void start() {
     auto self = shared_from_this();
+    if (forwarder_) {
+      std::weak_ptr<Session> weak = self;
+      forwarder_->set_drained_callback([weak] {
+        if (auto session = weak.lock()) session->on_forward_drained();
+      });
+      forwarder_->set_closed_callback([weak] {
+        if (auto session = weak.lock()) session->on_forward_closed();
+      });
+      forwarder_->set_error_callback([weak](const std::string&) {
+        if (auto session = weak.lock()) session->on_forward_error();
+      });
+      forwarder_->set_response_callback([weak](std::vector<uint8_t> bytes) {
+        if (auto session = weak.lock()) session->on_response(std::move(bytes));
+      });
+    }
     asio::post(strand_, [self] {
       if (self->closing_) return;
       self->opened_ns_ = now_wall_ns();
@@ -150,10 +176,28 @@ class Session : public std::enable_shared_from_this<Session> {
     }
     if (closing_) return;
 
+    // Forward the raw inbound bytes before framing validation. Forwarding is
+    // independent of the recording filter and never includes locally generated
+    // outbound messages.
+    if (forwarder_ && !forwarder_->failed() && !forwarder_->closed()) {
+      std::vector<uint8_t> bytes(read_buffer_.begin(),
+                                 read_buffer_.begin() + static_cast<std::ptrdiff_t>(n));
+      forwarder_->forward(std::move(bytes));
+    }
+
     std::string err;
     if (!validator_.feed(read_buffer_.data(), n, err)) {
       log_printf(LogLevel::Warn, "stream %u protocol error: %s", id_, err.c_str());
       do_close(CloseReason::ProtocolError);
+      return;
+    }
+
+    // Pause source reads while the forwarding backlog is full. The drained
+    // callback resumes reading, so no bytes are dropped.
+    if (forwarder_ && forwarder_->active() &&
+        forwarder_->queued_bytes() >= server_.config().forward.queue_limit) {
+      paused_ = true;
+      idle_timer_.cancel();
       return;
     }
     do_read();
@@ -251,12 +295,39 @@ class Session : public std::enable_shared_from_this<Session> {
       // async_write_some may complete partially; keep the remainder.
       write_queue_.front().erase(0, n);
       write_queue_bytes_ -= n;
-      do_write();
-      return;
+    } else {
+      write_queue_bytes_ -= write_queue_.front().size();
+      write_queue_.pop_front();
     }
-    write_queue_bytes_ -= write_queue_.front().size();
-    write_queue_.pop_front();
     do_write();
+
+    // The client has made room, so release the backpressure on the target.
+    if (forwarder_ && forwarder_->active() && forwarder_->responses_paused() &&
+        write_queue_bytes_ < server_.config().forward.queue_limit) {
+      forwarder_->resume_responses();
+    }
+  }
+
+  void on_response(std::vector<uint8_t> bytes) {
+    if (closing_ || bytes.empty()) return;
+
+    // Queue the bytes for the client first, then record a copy. The write
+    // queue holds payloads as strings; the capture item takes the buffer.
+    std::string queued(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    write_queue_bytes_ += bytes.size();
+    write_queue_.push_back(std::move(queued));
+    if (record_outbound_) {
+      submit(make_data(id_, Direction::Out, now_wall_ns(), std::move(bytes),
+                       server_.config().default_type_name));
+    }
+    if (closing_) return;
+    do_write();
+
+    // Backpressure on the target while the client backlog is full: pause
+    // reads until the write queue drains again. No bytes are lost.
+    if (forwarder_ && forwarder_->active() && write_queue_bytes_ >= server_.config().forward.queue_limit) {
+      forwarder_->pause_responses();
+    }
   }
 
   void do_close(CloseReason reason) {
@@ -274,6 +345,65 @@ class Session : public std::enable_shared_from_this<Session> {
       submit(make_stream_close(id_, reason, now_wall_ns()));
     }
     log_printf(LogLevel::Debug, "stream %u closed (%s)", id_, close_reason_name(reason));
+
+    // Keep the session (and its captured stream metadata) alive until the
+    // forwarding backlog has drained. Recording has already been committed.
+    if (forwarder_ && forwarder_->active()) {
+      forwarder_->close();
+      arm_forward_watchdog();
+      return;
+    }
+    finalize();
+  }
+
+  void on_forward_drained() {
+    if (closing_ || !paused_) return;
+    paused_ = false;
+    arm_idle_timer();
+    do_read();
+  }
+
+  void on_forward_error() {
+    // Forwarding stopped, but recording continues. Release any backpressure
+    // that was imposed by the forwarding queue.
+    if (closing_ || !paused_) return;
+    paused_ = false;
+    arm_idle_timer();
+    do_read();
+  }
+
+  void on_forward_closed() {
+    if (closing_) {
+      finalize();
+      return;
+    }
+    if (!paused_) return;
+    paused_ = false;
+    arm_idle_timer();
+    do_read();
+  }
+
+  void arm_forward_watchdog() {
+    constexpr auto kFinishTimeout = std::chrono::seconds(30);
+    forward_watchdog_.expires_after(kFinishTimeout);
+    auto self = shared_from_this();
+    forward_watchdog_.async_wait(asio::bind_executor(strand_, [self](const ErrorCode& ec) {
+      if (ec || self->finalized_) return;
+      log_printf(LogLevel::Warn, "stream %u: timed out flushing forward queue", self->id_);
+      if (self->forwarder_) self->forwarder_->abort();
+      self->finalize();
+    }));
+  }
+
+  void finalize() {
+    if (finalized_) return;
+    finalized_ = true;
+    forward_watchdog_.cancel();
+    if (forwarder_) {
+      server_.note_forward_result(forwarder_->started(), forwarder_->bytes_forwarded(),
+                                  forwarder_->connects(), forwarder_->failed(),
+                                  forwarder_->bytes_received());
+    }
     server_.on_session_closed(id_);
   }
 
@@ -286,6 +416,7 @@ class Session : public std::enable_shared_from_this<Session> {
   asio::steady_timer idle_timer_;
   asio::steady_timer once_timer_;
   asio::steady_timer every_timer_;
+  asio::steady_timer forward_watchdog_;
   std::deque<std::string> write_queue_;
   size_t write_queue_bytes_ = 0;
   bool write_in_progress_ = false;
@@ -297,6 +428,9 @@ class Session : public std::enable_shared_from_this<Session> {
   int64_t opened_ns_ = 0;
   uint64_t sent_count_ = 0;
   uint64_t dropped_sends_ = 0;
+  std::shared_ptr<SessionForwarder> forwarder_;
+  bool paused_ = false;
+  bool finalized_ = false;
 };
 
 Server::Server(asio::io_context& io, ServerConfig config, Recorder& recorder, JsonWriter* json)
@@ -446,6 +580,26 @@ void Server::set_stopped_callback(std::function<void()> callback) {
 size_t Server::active_sessions() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return sessions_.size();
+}
+
+void Server::note_forward_result(bool started, uint64_t bytes, uint64_t connects, bool failed,
+                                 uint64_t response_bytes) {
+  if (!started) return;
+  forward_streams_.fetch_add(1, std::memory_order_relaxed);
+  forward_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  forward_response_bytes_.fetch_add(response_bytes, std::memory_order_relaxed);
+  forward_connects_.fetch_add(connects, std::memory_order_relaxed);
+  if (failed) forward_failures_.fetch_add(1, std::memory_order_relaxed);
+}
+
+ForwardStats Server::forward_stats() const {
+  ForwardStats stats;
+  stats.streams = forward_streams_.load(std::memory_order_relaxed);
+  stats.bytes = forward_bytes_.load(std::memory_order_relaxed);
+  stats.response_bytes = forward_response_bytes_.load(std::memory_order_relaxed);
+  stats.connects = forward_connects_.load(std::memory_order_relaxed);
+  stats.failures = forward_failures_.load(std::memory_order_relaxed);
+  return stats;
 }
 
 }  // namespace prp
