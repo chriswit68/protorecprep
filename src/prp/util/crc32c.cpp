@@ -34,10 +34,10 @@ constexpr Tables kTables{};
 uint32_t crc32c_sw(uint32_t crc, const uint8_t* p, size_t n) {
   crc = ~crc;
   while (n >= 8) {
-    const uint32_t low = (crc ^ static_cast<uint32_t>(p[0])) |
-                         (static_cast<uint32_t>(p[1]) << 8) |
-                         (static_cast<uint32_t>(p[2]) << 16) |
-                         (static_cast<uint32_t>(p[3]) << 24);
+    const uint32_t low = crc ^ (static_cast<uint32_t>(p[0]) |
+                                (static_cast<uint32_t>(p[1]) << 8) |
+                                (static_cast<uint32_t>(p[2]) << 16) |
+                                (static_cast<uint32_t>(p[3]) << 24));
     crc = kTables.t[7][low & 0xFFu] ^ kTables.t[6][(low >> 8) & 0xFFu] ^
           kTables.t[5][(low >> 16) & 0xFFu] ^ kTables.t[4][(low >> 24) & 0xFFu] ^
           kTables.t[3][p[4]] ^ kTables.t[2][p[5]] ^ kTables.t[1][p[6]] ^ kTables.t[0][p[7]];

@@ -59,6 +59,16 @@ void test_crc32c() {
   // Streaming update must produce the same result.
   const uint32_t a = prp::crc32c_extend(0, text, 4);
   CHECK_EQ(prp::crc32c_extend(a, text + 4, 5), 0xE3069283u);
+
+  // Vectors that exercise the slice-by-8 software path under Linux/x86_64.
+  CHECK_EQ(prp::crc32c("abcdefgh", 8), 0x0A9421B7u);
+  CHECK_EQ(prp::crc32c("0123456789abcdef", 16), 0x42D3119Eu);
+  const char* xs = "xxxxxxxxxxxxxxxxx";
+  CHECK_EQ(prp::crc32c(xs, 17), 0xE366B97Bu);
+
+  // Streaming across the 8-byte block boundary must match the one-shot result.
+  const uint32_t b = prp::crc32c_extend(0, xs, 8);
+  CHECK_EQ(prp::crc32c_extend(b, xs + 8, 9), 0xE366B97Bu);
 }
 
 void test_sha256() {
