@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,9 @@ struct Options {
   // type-map itself is the only source of message ids for typed framing.
   std::string proto_package;
   std::map<uint32_t, std::string> type_map;  // message type id -> proto message name
+  // Type ids whose payloads are raw files/blobs rather than protobuf messages
+  // (configured with "<id>=@file" or "<id>=@blob").
+  std::set<uint32_t> file_types;
   rec::Framing framing = rec::Framing::VarintLength;
   bool json_enabled = false;
   // JSONL data file override. Relative paths are resolved against the session

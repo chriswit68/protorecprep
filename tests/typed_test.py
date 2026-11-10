@@ -213,6 +213,89 @@ def test_send_typed(binary: str, proto: str, workdir: str) -> None:
     check(outbound[0]["message"]["name"] == "typed-out", outbound[0])
 
 
+def wav_bytes() -> bytes:
+    fmt = struct.pack("<HHIIHH", 1, 1, 8000, 16000, 2, 16)
+    body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", 0)
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def test_blob_channel(binary: str, proto: str, workdir: str) -> None:
+    out_dir = os.path.join(workdir, "blob")
+    port = pick_port()
+    proc, stderr_file, stderr_path = start(
+        binary, "record", out_dir, port,
+        ["--proto", proto, "--json", "--type-map", "3=@file"],
+    )
+    pcap = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 149)
+    wav = wav_bytes()
+    text = b"Hallo Thuraya"
+    unknown = b"\x00\x01\x02\x03\xff\xfe"
+    prefix = struct.pack("<I", 1)
+    wire = (
+        typed_frame(3, prefix + pcap)
+        + typed_frame(3, prefix + wav)
+        + typed_frame(3, prefix + text)
+        + typed_frame(3, prefix + unknown)
+    )
+    try:
+        sock = wait_for_server(port, time.time() + 10.0)
+        sock.sendall(wire)
+        sock.close()
+        time.sleep(0.2)
+    finally:
+        stop(proc, stderr_file, stderr_path)
+
+    events = read_events(out_dir)
+    blobs = [e for e in events if e.get("type") == "@file"]
+    check(len(blobs) == 4, blobs)
+    check(all(e["type_id"] == 3 for e in blobs), blobs)
+    by_kind: dict[str, list[dict]] = {}
+    for event in blobs:
+        by_kind.setdefault(event["blob"]["kind"], []).append(event)
+    check(set(by_kind) == {"pcap", "wav", "text", "unknown"}, by_kind)
+
+    text_blob = by_kind["text"][0]["blob"]
+    check(text_blob["text"] == "Hallo Thuraya", text_blob)
+    check(text_blob["size"] == len(text), text_blob)
+    check("bytes_b64" not in by_kind["pcap"][0]["blob"], by_kind["pcap"])
+    check("bytes_b64" not in by_kind["wav"][0]["blob"], by_kind["wav"])
+    check("bytes_b64" in by_kind["unknown"][0]["blob"], by_kind["unknown"])
+    for event in blobs:
+        blob = event["blob"]
+        check(blob.get("prefix") == 1, event)
+        check(len(blob["sha256"]) == 64, event)
+        check(os.path.isfile(blob["path"]), event)
+
+    files_dir = os.path.join(out_dir, "files")
+    names = sorted(os.listdir(files_dir))
+    check(len(names) == 4, names)
+    contents: dict[str, list[bytes]] = {}
+    for name in names:
+        with open(os.path.join(files_dir, name), "rb") as handle:
+            contents.setdefault(os.path.splitext(name)[1], []).append(handle.read())
+    check(contents.get(".pcap") == [pcap], contents)
+    check(contents.get(".wav") == [wav], contents)
+    check(contents.get(".txt") == [text], contents)
+    check(contents.get(".bin") == [unknown], contents)
+
+    with open(os.path.join(out_dir, "meta.json")) as handle:
+        meta = json.load(handle)
+    check(meta["type_map"].get("3") == "@file", meta["type_map"])
+    check(meta.get("blob_dir", "").endswith("files"), meta)
+
+    with open(os.path.join(out_dir, "summary.json")) as handle:
+        summary = json.load(handle)
+    with open(os.path.join(out_dir, "json-summary.json")) as handle:
+        json_summary = json.load(handle)
+    check(json_summary["blobs"] == 4, json_summary)
+    check(
+        json_summary["blob_bytes"] == len(pcap) + len(wav) + len(text) + len(unknown),
+        json_summary,
+    )
+    # The binary capture stays byte-exact and includes the 8-byte headers.
+    check(summary["data_bytes"] == len(wire), summary)
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print("usage: typed_test.py <binary> <sample.proto>", file=sys.stderr)
@@ -224,6 +307,7 @@ def main() -> int:
         test_record_typed(binary, proto, workdir)
         test_passthrough_typed(binary, proto, workdir)
         test_send_typed(binary, proto, workdir)
+        test_blob_channel(binary, proto, workdir)
     finally:
         import shutil
 

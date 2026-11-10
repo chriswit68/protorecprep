@@ -1,14 +1,111 @@
 #include "prp/json/json_writer.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstring>
 
 #include "prp/util/base64.h"
+#include "prp/util/bytes.h"
 #include "prp/util/log.h"
+#include "prp/util/sha256.h"
 #include "prp/util/text.h"
 
 namespace prp {
+namespace {
+
+bool has_magic(std::string_view data, std::string_view magic) {
+  return data.size() >= magic.size() && data.substr(0, magic.size()) == magic;
+}
+
+bool is_utf8_text(std::string_view data) {
+  size_t i = 0;
+  while (i < data.size()) {
+    const unsigned char c = static_cast<unsigned char>(data[i]);
+    if (c < 0x80) {
+      if ((c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7F) return false;
+      ++i;
+      continue;
+    }
+    size_t length = 0;
+    uint32_t codepoint = 0;
+    if ((c & 0xE0) == 0xC0) {
+      length = 2;
+      codepoint = c & 0x1F;
+    } else if ((c & 0xF0) == 0xE0) {
+      length = 3;
+      codepoint = c & 0x0F;
+    } else if ((c & 0xF8) == 0xF0) {
+      length = 4;
+      codepoint = c & 0x07;
+    } else {
+      return false;
+    }
+    if (i + length > data.size()) return false;
+    for (size_t k = 1; k < length; ++k) {
+      const unsigned char continuation = static_cast<unsigned char>(data[i + k]);
+      if ((continuation & 0xC0) != 0x80) return false;
+      codepoint = (codepoint << 6) | (continuation & 0x3F);
+    }
+    if ((length == 2 && codepoint < 0x80) || (length == 3 && codepoint < 0x800) ||
+        (length == 4 && codepoint < 0x10000) || codepoint > 0x10FFFF ||
+        (codepoint >= 0xD800 && codepoint <= 0xDFFF)) {
+      return false;
+    }
+    i += length;
+  }
+  return true;
+}
+
+const char* detect_blob_kind(std::string_view data) {
+  if (has_magic(data, std::string_view("\xd4\xc3\xb2\xa1", 4)) ||
+      has_magic(data, std::string_view("\xa1\xb2\xc3\xd4", 4))) {
+    return "pcap";
+  }
+  if (has_magic(data, std::string_view("\x0a\x0d\x0d\x0a", 4))) return "pcapng";
+  if (data.size() >= 12 && has_magic(data, "RIFF") && data.substr(8, 4) == "WAVE") return "wav";
+  if (has_magic(data, std::string_view("\x89PNG\r\n\x1a\n", 8))) return "png";
+  if (has_magic(data, std::string_view("\xff\xd8\xff", 3))) return "jpeg";
+  if (has_magic(data, "GIF87a") || has_magic(data, "GIF89a")) return "gif";
+  if (has_magic(data, "%PDF-")) return "pdf";
+  if (has_magic(data, std::string_view("PK\x03\x04", 4))) return "zip";
+  if (has_magic(data, std::string_view("\x1f\x8b", 2))) return "gzip";
+  if (has_magic(data, std::string_view("\x28\xb5\x2f\xfd", 4))) return "zstd";
+  if (!data.empty() && is_utf8_text(data)) return "text";
+  return "unknown";
+}
+
+const char* blob_extension(std::string_view kind) {
+  if (kind == "pcap") return "pcap";
+  if (kind == "pcapng") return "pcapng";
+  if (kind == "wav") return "wav";
+  if (kind == "png") return "png";
+  if (kind == "jpeg") return "jpg";
+  if (kind == "gif") return "gif";
+  if (kind == "pdf") return "pdf";
+  if (kind == "zip") return "zip";
+  if (kind == "gzip") return "gz";
+  if (kind == "zstd") return "zst";
+  if (kind == "text") return "txt";
+  return "bin";
+}
+
+std::string hex_prefix(std::string_view data, size_t max_bytes) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  const size_t count = std::min(max_bytes, data.size());
+  std::string out;
+  out.reserve(count * 3 + 4);
+  for (size_t i = 0; i < count; ++i) {
+    if (i != 0) out.push_back(' ');
+    const unsigned char byte = static_cast<unsigned char>(data[i]);
+    out.push_back(kHex[byte >> 4]);
+    out.push_back(kHex[byte & 0x0F]);
+  }
+  if (data.size() > count) out += " ...";
+  return out;
+}
+
+}  // namespace
 
 struct JsonWriter::StreamState {
   struct Channel {
@@ -39,6 +136,14 @@ bool JsonWriter::start(std::string& err) {
     err = "json writer already started";
     return false;
   }
+  if (!config_.file_types.empty() && !config_.files_dir.empty()) {
+    std::string dir_err;
+    if (!ensure_directory(config_.files_dir, dir_err)) {
+      started_.store(false);
+      err = "cannot create blob directory " + config_.files_dir.string() + ": " + dir_err;
+      return false;
+    }
+  }
   file_ = std::fopen(config_.output_path.c_str(), "wb");
   if (!file_) {
     started_.store(false);
@@ -65,6 +170,8 @@ JsonWriterStats JsonWriter::stats() const {
   JsonWriterStats s;
   s.events = events_.load(std::memory_order_relaxed);
   s.messages = messages_.load(std::memory_order_relaxed);
+  s.blobs = blobs_.load(std::memory_order_relaxed);
+  s.blob_bytes = blob_bytes_.load(std::memory_order_relaxed);
   s.unparsed = unparsed_.load(std::memory_order_relaxed);
   s.parse_errors = parse_errors_.load(std::memory_order_relaxed);
   s.dropped_items = queue_.dropped_items();
@@ -196,6 +303,91 @@ void JsonWriter::emit_unparsed(uint32_t stream_id, Direction dir, int64_t ts_ns,
   unparsed_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void JsonWriter::emit_blob(uint32_t stream_id, Direction dir, int64_t ts_ns, uint32_t type_id,
+                           std::string_view payload) {
+  // Blob channels prepend a u32 LE flag/counter (observed value 1) in front of
+  // the complete file. Strip it when present so the extracted file is intact.
+  std::string_view data = payload;
+  uint32_t prefix = 0;
+  bool has_prefix = false;
+  if (data.size() >= 4) {
+    const uint32_t candidate =
+        get_u32le(reinterpret_cast<const uint8_t*>(data.data()));
+    if (candidate == 1) {
+      prefix = candidate;
+      has_prefix = true;
+      data.remove_prefix(4);
+    }
+  }
+
+  const char* kind = detect_blob_kind(data);
+  const std::string_view kind_view(kind);
+  const std::string digest = Sha256::hex_of(data);
+
+  std::string path;
+  std::string write_error;
+  if (!config_.files_dir.empty()) {
+    const std::string filename = std::to_string(seq_ + 1) + "-" + kind + "." +
+                                 blob_extension(kind_view);
+    const fs::path target = config_.files_dir / filename;
+    if (write_file_atomic(target, data, write_error)) {
+      path = target.string();
+    } else {
+      log_printf(LogLevel::Warn, "stream %u: cannot write blob %s: %s", stream_id,
+                 target.string().c_str(), write_error.c_str());
+    }
+  } else {
+    write_error = "no blob directory configured";
+  }
+
+  buffer_ += "{\"seq\":";
+  buffer_ += std::to_string(++seq_);
+  buffer_ += ",\"ts_ns\":";
+  buffer_ += std::to_string(ts_ns);
+  buffer_ += ",\"stream\":";
+  buffer_ += std::to_string(stream_id);
+  buffer_ += ",\"dir\":\"";
+  buffer_ += dir == Direction::In ? "in" : "out";
+  buffer_ += "\",\"type\":\"@file\",\"type_id\":";
+  buffer_ += std::to_string(type_id);
+  buffer_ += ",\"blob\":{\"kind\":\"";
+  buffer_ += kind;
+  buffer_ += "\",\"size\":";
+  buffer_ += std::to_string(data.size());
+  buffer_ += ",\"sha256\":\"";
+  buffer_ += digest;
+  buffer_ += "\"";
+  if (has_prefix) {
+    buffer_ += ",\"prefix\":";
+    buffer_ += std::to_string(prefix);
+  }
+  if (!path.empty()) {
+    buffer_ += ",\"path\":\"";
+    buffer_ += json_escape(path);
+    buffer_ += "\"";
+  }
+  if (!write_error.empty()) {
+    buffer_ += ",\"error\":\"";
+    buffer_ += json_escape(write_error);
+    buffer_ += "\"";
+  }
+  // Keep the sidecar compact: only small text and small unknown blobs are
+  // embedded. Everything else stays in the extracted file.
+  if (kind_view == "text" && data.size() <= config_.max_inline_blob) {
+    buffer_ += ",\"text\":\"";
+    buffer_ += json_escape(data);
+    buffer_ += "\"";
+  } else if (kind_view == "unknown" && data.size() <= config_.max_inline_blob) {
+    buffer_ += ",\"bytes_b64\":\"";
+    buffer_ += base64_encode(data);
+    buffer_ += "\"";
+  }
+  buffer_ += "}}\n";
+  events_.fetch_add(1, std::memory_order_relaxed);
+  blobs_.fetch_add(1, std::memory_order_relaxed);
+  blob_bytes_.fetch_add(data.size(), std::memory_order_relaxed);
+}
+
 void JsonWriter::handle_open(const CaptureItem& item) {
   StreamState* state = state_for(item.stream_id, true);
   state->stream_type = item.type_name.empty() ? config_.default_type_name : item.type_name;
@@ -246,6 +438,10 @@ void JsonWriter::handle_data(const CaptureItem& item) {
         channel.reader->clear();
         break;
       }
+      if (config_.file_types.find(frame.type_id) != config_.file_types.end()) {
+        emit_blob(item.stream_id, item.dir, item.ts_ns, frame.type_id, frame.payload);
+        continue;
+      }
       const auto mapped = config_.type_map.find(frame.type_id);
       if (mapped == config_.type_map.end()) {
         emit_unparsed(item.stream_id, item.dir, item.ts_ns,
@@ -279,7 +475,9 @@ void JsonWriter::handle_data(const CaptureItem& item) {
       message->Clear();
       if (!message->ParseFromArray(frame.payload.data(), static_cast<int>(frame.payload.size()))) {
         parse_errors_.fetch_add(1, std::memory_order_relaxed);
-        emit_unparsed(item.stream_id, item.dir, item.ts_ns, "protobuf parse failed",
+        emit_unparsed(item.stream_id, item.dir, item.ts_ns,
+                      "protobuf parse failed for " + mapped->second + " (first bytes " +
+                          hex_prefix(frame.payload, 16) + ")",
                       reinterpret_cast<const uint8_t*>(frame.payload.data()), frame.payload.size(),
                       frame.type_id, true);
         continue;
@@ -315,7 +513,10 @@ void JsonWriter::handle_data(const CaptureItem& item) {
     channel.message->Clear();
     if (!channel.message->ParseFromArray(frame.data(), static_cast<int>(frame.size()))) {
       parse_errors_.fetch_add(1, std::memory_order_relaxed);
-      emit_unparsed(item.stream_id, item.dir, item.ts_ns, "protobuf parse failed",
+      std::string reason = "protobuf parse failed";
+      if (!channel.type_name.empty()) reason += " for " + channel.type_name;
+      reason += " (first bytes " + hex_prefix(frame, 16) + ")";
+      emit_unparsed(item.stream_id, item.dir, item.ts_ns, reason,
                     reinterpret_cast<const uint8_t*>(frame.data()), frame.size());
       continue;
     }
@@ -418,9 +619,10 @@ void JsonWriter::run() {
   }
   const JsonWriterStats s = stats();
   log_printf(LogLevel::Info,
-             "json writer stopped: events=%" PRIu64 " messages=%" PRIu64 " unparsed=%" PRIu64
-             " dropped=%" PRIu64 " desynced=%" PRIu64 " bytes=%" PRIu64,
-             s.events, s.messages, s.unparsed, s.dropped_items, s.desynced_streams, s.bytes_written);
+             "json writer stopped: events=%" PRIu64 " messages=%" PRIu64 " blobs=%" PRIu64
+             " unparsed=%" PRIu64 " dropped=%" PRIu64 " desynced=%" PRIu64 " bytes=%" PRIu64,
+             s.events, s.messages, s.blobs, s.unparsed, s.dropped_items, s.desynced_streams,
+             s.bytes_written);
 }
 
 }  // namespace prp

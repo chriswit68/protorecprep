@@ -104,8 +104,9 @@ Jeder Frame beginnt mit zwei Little-Endian-`uint32`:
 
 Alle Message-Typen laufen über dieselbe TCP-Verbindung; die ID im Header
 bestimmt den Proto-Typ. Die Zuordnung wird ausschließlich manuell über
-`type_map` gepflegt (`<id>=<Message>`). Nur ID `0` ist durch das Protokoll
-festgelegt (`VersionInformation`); weitere IDs kommen mit der Zeit dazu.
+`type_map` gepflegt (`<id>=<Message>` oder `<id>=@file` für Dateikanäle). Nur
+ID `0` ist durch das Protokoll festgelegt (`VersionInformation`); weitere IDs
+kommen mit der Zeit dazu.
 
 `proto_package` wird als Präfix verwendet, wenn ein Name in `type_map` nicht
 voll qualifiziert ist. Namen werden beim Start gegen das Schema geprüft und
@@ -123,6 +124,7 @@ framing = typed-length-le
 type_map = 0=VersionInformation
 type_map = 1=TestRecord
 type_map = 2=Nested
+# type_map = 3=@file
 
 [json]
 json = true
@@ -150,6 +152,40 @@ Bekannte Typen werden mit lesbarem Namen und ID ausgegeben:
 {"seq":2,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
  "type":"demo.TestRecord","type_id":1,"message":{"seq":"1","name":"hello"}}
 ```
+
+### Datei-/Blob-Kanäle (`@file`)
+
+Manche Typ-IDs transportieren keine Protobuf-Message, sondern eine komplette
+Datei (z. B. pcap-Mitschnitte, WAV-Audio oder SMS-Text). Solche IDs werden mit
+`@file` (Alias `@blob`) statt eines Message-Namens konfiguriert:
+
+```ini
+type_map = 3=@file
+```
+
+Der Payload beginnt optional mit einem 4-Byte-LE-Flag (`01 00 00 00`), gefolgt
+von der vollständigen Datei. Das Flag wird beim Extrahieren entfernt. Der
+Dateityp wird anhand der Magic erkannt (`pcap`, `pcapng`, `wav`, `png`, `jpeg`,
+`gif`, `pdf`, `zip`, `gzip`, `zstd`, `text`, sonst `unknown`) und die Datei
+atomar unter `<session>/files/<seq>-<kind>.<ext>` geschrieben.
+
+Im JSONL-Sidecar bleibt das Event klein; es enthält nur Metadaten:
+
+```json
+{"seq":48,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
+ "type":"@file","type_id":3,
+ "blob":{"kind":"pcap","size":388,"sha256":"…",
+         "path":"…/files/48-pcap.pcap","prefix":1}}
+```
+
+Kleine Textblobs (bis 64 KiB) werden zusätzlich als `text` eingebettet, kleine
+unbekannte Blobs als `bytes_b64`. Bekannte Binärformate werden nie base64
+dupliziert. `meta.json` führt Blob-IDs in `type_map` als `"@file"` und nennt das
+Ausgabeverzeichnis unter `blob_dir`; `json-summary.json` zählt `blobs` und
+`blob_bytes`.
+
+Die Binäraufnahme bleibt unverändert byte-genau inklusive Header und damit
+replayfähig.
 
 Die vollständige Zuordnung steht zusätzlich in `meta.json` unter `type_map`;
 `proto_package` und der Modus (`framing`) sind dort ebenfalls vermerkt.

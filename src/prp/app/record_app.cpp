@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -80,7 +81,8 @@ bool resolve_type_map(const std::map<uint32_t, std::string>& input, const std::s
 std::string meta_json(const Options& options, const Schema& schema, const fs::path& session_dir,
                       const fs::path& json_path, const std::string& session_id, const SendSpec& send,
                       const ForwardConfig& forward,
-                      const std::map<uint32_t, std::string>& type_map) {
+                      const std::map<uint32_t, std::string>& type_map,
+                      const std::set<uint32_t>& file_types, const fs::path& files_dir) {
   const char* framing = rec::framing_name(options.framing);
   std::string json = "{\n";
   json += "  \"tool\": \"protorecprep\",\n";
@@ -97,13 +99,18 @@ std::string meta_json(const Options& options, const Schema& schema, const fs::pa
   json += "  \"proto_sha256\": \"" + schema.digest_hex() + "\",\n";
   json += "  \"message_type\": \"" + json_escape(options.message_type) + "\",\n";
   json += "  \"proto_package\": \"" + json_escape(options.proto_package) + "\",\n";
+  std::map<uint32_t, std::string> combined_map = type_map;
+  for (uint32_t type_id : file_types) combined_map.emplace(type_id, "@file");
   json += "  \"type_map\": {";
   size_t map_index = 0;
-  for (const auto& [type_id, type_name] : type_map) {
+  for (const auto& [type_id, type_name] : combined_map) {
     if (map_index++ != 0) json += ", ";
     json += "\"" + std::to_string(type_id) + "\": \"" + json_escape(type_name) + "\"";
   }
   json += "},\n";
+  if (!files_dir.empty()) {
+    json += "  \"blob_dir\": \"" + json_escape(files_dir.string()) + "\",\n";
+  }
   json += "  \"json\": " + std::string(options.json_enabled ? "true" : "false") + ",\n";
   if (options.json_enabled) {
     json += "  \"json_file\": \"" + json_escape(json_path.string()) + "\",\n";
@@ -146,6 +153,8 @@ void write_json_summary(const JsonWriter& writer, const fs::path& dir) {
   std::string json = "{\n";
   json += "  \"events\": " + std::to_string(s.events) + ",\n";
   json += "  \"messages\": " + std::to_string(s.messages) + ",\n";
+  json += "  \"blobs\": " + std::to_string(s.blobs) + ",\n";
+  json += "  \"blob_bytes\": " + std::to_string(s.blob_bytes) + ",\n";
   json += "  \"unparsed\": " + std::to_string(s.unparsed) + ",\n";
   json += "  \"parse_errors\": " + std::to_string(s.parse_errors) + ",\n";
   json += "  \"dropped_items\": " + std::to_string(s.dropped_items) + ",\n";
@@ -196,14 +205,19 @@ int run_server_mode(const Options& options, std::string& err) {
       }
       default_type_name = std::string(descriptor->full_name());
     }
-    if (!options.type_map.empty()) {
-      if (!resolve_type_map(options.type_map, options.proto_package, schema, type_map, err)) {
+    if (!options.type_map.empty() || !options.file_types.empty()) {
+      if (!options.type_map.empty() &&
+          !resolve_type_map(options.type_map, options.proto_package, schema, type_map, err)) {
         return fail(err);
       }
       std::string joined;
       for (const auto& [type_id, type_name] : type_map) {
         if (!joined.empty()) joined += ", ";
         joined += std::to_string(type_id) + "=" + type_name;
+      }
+      for (uint32_t type_id : options.file_types) {
+        if (!joined.empty()) joined += ", ";
+        joined += std::to_string(type_id) + "=@file";
       }
       log_printf(LogLevel::Info, "message type map: %s", joined.c_str());
     }
@@ -212,6 +226,11 @@ int run_server_mode(const Options& options, std::string& err) {
   std::string descriptor_set;
   if (schema.loaded()) {
     if (!schema.build_descriptor_set(descriptor_set, err)) return fail(err);
+  }
+
+  if (!options.file_types.empty() && !options.json_enabled) {
+    log_printf(LogLevel::Warn,
+               "@file type-map entries require --json; blob payloads will not be extracted");
   }
 
   SendSpec send;
@@ -307,6 +326,16 @@ int run_server_mode(const Options& options, std::string& err) {
     }
   }
 
+  // Raw file/blob channels are extracted next to the JSON sidecar so all
+  // artifacts of a session stay together.
+  fs::path files_dir;
+  if (options.json_enabled && !options.file_types.empty()) {
+    files_dir = session_dir / "files";
+    if (!ensure_directory(files_dir, err)) {
+      return fail("cannot create blob output directory: " + err);
+    }
+  }
+
   asio::io_context io;
   std::unique_ptr<JsonWriter> json;
   if (options.json_enabled) {
@@ -316,6 +345,8 @@ int run_server_mode(const Options& options, std::string& err) {
     json_config.default_type_name = default_type_name;
     json_config.proto_package = options.proto_package;
     json_config.type_map = type_map;
+    json_config.file_types = options.file_types;
+    json_config.files_dir = files_dir;
     json_config.framing = options.framing;
     json_config.max_frame = options.max_frame;
     json_config.print_defaults = options.json_print_defaults;
@@ -347,7 +378,7 @@ int run_server_mode(const Options& options, std::string& err) {
   Server server(io, server_config, recorder, json.get());
 
   const std::string meta = meta_json(options, schema, session_dir, json_path, session_id, send,
-                                     server_config.forward, type_map);
+                                     server_config.forward, type_map, options.file_types, files_dir);
   if (!write_file_atomic(session_dir / "meta.json", meta, err)) {
     log_error("could not write meta.json: " + err);
     return 2;

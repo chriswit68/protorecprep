@@ -253,6 +253,29 @@ void test_type_map_options() {
                  options, err));
     CHECK(err.find("duplicate message name") != std::string::npos);
   }
+  {
+    // @file/@blob entries become raw file channels, not schema lookups.
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                 "--framing", "typed", "--type-map", "0=VersionInformation",
+                 "--type-map", "3=@file", "--type-map", "4=@blob"},
+                options, err));
+    CHECK_EQ(options.type_map.size(), size_t{1});
+    CHECK_EQ(options.type_map.at(0), std::string("VersionInformation"));
+    CHECK_EQ(options.file_types.size(), size_t{2});
+    CHECK(options.file_types.count(3) == 1);
+    CHECK(options.file_types.count(4) == 1);
+  }
+  {
+    // A blob id cannot also be mapped to a protobuf message.
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--type-map", "3=@file", "--type-map", "3=demo.A"},
+                 options, err));
+    CHECK(err.find("duplicate message type id") != std::string::npos);
+  }
 }
 
 void test_chunk_and_json_options() {
@@ -1064,8 +1087,53 @@ void test_typed_json_writer(const char* proto_path) {
   std::string nested_bytes;
   CHECK(nested->SerializeToString(&nested_bytes));
 
+  auto add_u16 = [](std::string& out, uint16_t value) {
+    char bytes[2];
+    prp::put_u16le(reinterpret_cast<uint8_t*>(bytes), value);
+    out.append(bytes, 2);
+  };
+  auto add_u32 = [](std::string& out, uint32_t value) {
+    char bytes[4];
+    prp::put_u32le(reinterpret_cast<uint8_t*>(bytes), value);
+    out.append(bytes, 4);
+  };
+
+  // Minimal little-endian pcap global header (link type 149).
+  std::string pcap("\xd4\xc3\xb2\xa1", 4);
+  add_u16(pcap, 2);
+  add_u16(pcap, 4);
+  add_u32(pcap, 0);
+  add_u32(pcap, 0);
+  add_u32(pcap, 65535);
+  add_u32(pcap, 149);
+
+  // Minimal mono 8 kHz 16-bit WAV file (RIFF + fmt + empty data).
+  std::string wav = "RIFF";
+  add_u32(wav, 36);
+  wav += "WAVE";
+  wav += "fmt ";
+  add_u32(wav, 16);
+  add_u16(wav, 1);
+  add_u16(wav, 1);
+  add_u32(wav, 8000);
+  add_u32(wav, 16000);
+  add_u16(wav, 2);
+  add_u16(wav, 16);
+  wav += "data";
+  add_u32(wav, 0);
+
+  const std::string text = "Hallo Thuraya";
+  const std::string unknown("\x00\x01\x02\x03\xff\xfe", 6);
+  const std::string blob_prefix("\x01\x00\x00\x00", 4);
+
   const std::string wire = prp::frame_typed_message(1, record_bytes) +
                            prp::frame_typed_message(2, nested_bytes) +
+                           prp::frame_typed_message(3, blob_prefix + pcap) +
+                           prp::frame_typed_message(4, blob_prefix + wav) +
+                           prp::frame_typed_message(5, blob_prefix + text) +
+                           prp::frame_typed_message(6, blob_prefix + unknown) +
+                           // No prefix: the file is still detected as WAV.
+                           prp::frame_typed_message(7, wav) +
                            prp::frame_typed_message(9, "unknown");
 
   prp::JsonWriterConfig config;
@@ -1073,6 +1141,8 @@ void test_typed_json_writer(const char* proto_path) {
   config.schema = &schema;
   config.framing = prp::rec::Framing::TypedLengthLE;
   config.type_map = {{1, "demo.TestRecord"}, {2, "demo.Nested"}};
+  config.file_types = {3, 4, 5, 6, 7};
+  config.files_dir = dir / "files";
   prp::JsonWriter writer(config);
   CHECK(writer.start(err));
 
@@ -1085,6 +1155,8 @@ void test_typed_json_writer(const char* proto_path) {
   const auto stats = writer.stats();
   CHECK(!stats.failed);
   CHECK_EQ(stats.messages, 2ull);
+  CHECK_EQ(stats.blobs, 5ull);
+  CHECK_EQ(stats.blob_bytes, pcap.size() + 2 * wav.size() + text.size() + unknown.size());
   CHECK_EQ(stats.unparsed, 1ull);
   CHECK_EQ(stats.parse_errors, 0ull);
 
@@ -1096,6 +1168,41 @@ void test_typed_json_writer(const char* proto_path) {
   CHECK(content.find("\"type_id\":9") != std::string::npos);
   CHECK(content.find("typed") != std::string::npos);
   CHECK(content.find("nested-typed") != std::string::npos);
+  CHECK(content.find("\"type\":\"@file\",\"type_id\":3") != std::string::npos);
+  CHECK(content.find("\"kind\":\"pcap\"") != std::string::npos);
+  CHECK(content.find("\"kind\":\"wav\"") != std::string::npos);
+  CHECK(content.find("\"kind\":\"text\"") != std::string::npos);
+  CHECK(content.find("\"text\":\"Hallo Thuraya\"") != std::string::npos);
+  CHECK(content.find("\"kind\":\"unknown\"") != std::string::npos);
+  CHECK(content.find("\"bytes_b64\":\"AAECA//+\"") != std::string::npos);
+  CHECK(content.find(",\"sha256\":\"") != std::string::npos);
+  CHECK(content.find(",\"path\":\"") != std::string::npos);
+  size_t prefix_count = 0;
+  for (size_t pos = 0; (pos = content.find("\"prefix\":1", pos)) != std::string::npos; ++pos) {
+    ++prefix_count;
+  }
+  CHECK_EQ(prefix_count, size_t{4});
+
+  size_t files = 0;
+  bool saw_pcap = false;
+  bool saw_wav = false;
+  bool saw_text = false;
+  bool saw_unknown = false;
+  for (const auto& entry : std::filesystem::directory_iterator(config.files_dir)) {
+    ++files;
+    std::string data;
+    CHECK(prp::read_file(entry.path(), data, err));
+    const std::string extension = entry.path().extension().string();
+    if (extension == ".pcap") saw_pcap = data == pcap;
+    else if (extension == ".wav") saw_wav = data == wav;
+    else if (extension == ".txt") saw_text = data == text;
+    else if (extension == ".bin") saw_unknown = data == unknown;
+  }
+  CHECK_EQ(files, size_t{5});
+  CHECK(saw_pcap);
+  CHECK(saw_wav);
+  CHECK(saw_text);
+  CHECK(saw_unknown);
 
   std::filesystem::remove_all(dir);
 }

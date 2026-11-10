@@ -164,10 +164,12 @@ bool parse_type_id(std::string_view raw, uint32_t& out) {
   return true;
 }
 
-bool append_type_map(std::string_view text, std::map<uint32_t, std::string>& out, std::string& err) {
+bool append_type_map(std::string_view text, std::map<uint32_t, std::string>& out,
+                     std::set<uint32_t>& file_types, std::string& err) {
   const size_t eq = text.find('=');
   if (eq == std::string_view::npos) {
-    err = "invalid --type-map value (expected <id>=<message>): " + std::string(text);
+    err = "invalid --type-map value (expected <id>=<message> or <id>=@file): " +
+          std::string(text);
     return false;
   }
   const std::string id_text = trim(text.substr(0, eq));
@@ -181,9 +183,16 @@ bool append_type_map(std::string_view text, std::map<uint32_t, std::string>& out
     err = "empty message name in --type-map for id " + std::to_string(id);
     return false;
   }
-  if (out.find(id) != out.end()) {
+  if (out.find(id) != out.end() || file_types.find(id) != file_types.end()) {
     err = "duplicate message type id " + std::to_string(id) + " in --type-map";
     return false;
+  }
+  const std::string lowered = lower(name);
+  if (lowered == "@file" || lowered == "@blob") {
+    // Raw file/blob channel: the payload is not protobuf and is written to
+    // <session>/files instead of being decoded against the schema.
+    file_types.insert(id);
+    return true;
   }
   for (const auto& [existing_id, existing_name] : out) {
     if (existing_name == name) {
@@ -489,7 +498,7 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
     } else if (key == "--type-map") {
       std::string text;
       if (!need_value(text)) return false;
-      if (!append_type_map(text, out.type_map, err)) return false;
+      if (!append_type_map(text, out.type_map, out.file_types, err)) return false;
     } else if (key == "--framing") {
       std::string text;
       if (!need_value(text)) return false;
@@ -666,7 +675,8 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       err = "--proto-package requires --proto <file.proto>";
       return false;
     }
-    if (out.json_enabled && out.framing == rec::Framing::TypedLengthLE && out.type_map.empty()) {
+    if (out.json_enabled && out.framing == rec::Framing::TypedLengthLE && out.type_map.empty() &&
+        out.file_types.empty()) {
       err = "--json with typed framing requires at least one --type-map entry";
       return false;
     }
@@ -832,7 +842,10 @@ void print_help() {
       "  --proto-path <dir>          Additional import path (repeatable)\n"
       "  --proto-package <pkg>       Package prefix for unqualified type-map names\n"
       "  --message-type <pkg.Msg>    Message type for inbound streams (not with typed framing)\n"
-      "  --type-map <id>=<pkg.Msg>   Message type id for typed framing (repeatable)\n"
+      "  --type-map <id>=<type>     Type id for typed framing (repeatable); use\n"
+      "                              <id>=@file for a raw file/blob channel\n"
+      "                              (blobs go to <session>/files and appear as\n"
+      "                              type \"@file\" in the JSONL sidecar)\n"
       "  --framing <mode>            raw|varint-length|typed-length-le (default varint-length)\n"
       "  --json[=jsonl|off]          Enable JSONL sidecar (requires --proto)\n"
       "  --json-file <path>          JSONL data file (default <session>/events.jsonl)\n"

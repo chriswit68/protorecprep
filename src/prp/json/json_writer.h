@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -26,6 +27,9 @@ struct JsonWriterConfig {
   std::string default_type_name;
   std::string proto_package;                 // fallback prefix for type_map names
   std::map<uint32_t, std::string> type_map;  // typed framing: id -> message name
+  std::set<uint32_t> file_types;             // typed framing: ids that carry raw files
+  fs::path files_dir;                        // where extracted blobs are written
+  size_t max_inline_blob = 64ull * 1024;     // text/base64 fallback limit
   rec::Framing framing = rec::Framing::VarintLength;
   size_t max_queue_bytes = 64ull * 1024 * 1024;
   size_t max_frame = 16ull * 1024 * 1024;
@@ -36,6 +40,8 @@ struct JsonWriterConfig {
 struct JsonWriterStats {
   uint64_t events = 0;
   uint64_t messages = 0;
+  uint64_t blobs = 0;
+  uint64_t blob_bytes = 0;
   uint64_t unparsed = 0;
   uint64_t parse_errors = 0;
   uint64_t dropped_items = 0;
@@ -86,6 +92,8 @@ class JsonWriter {
                     bool has_type = false);
   void emit_unparsed(uint32_t stream_id, Direction dir, int64_t ts_ns, std::string_view reason,
                      const uint8_t* bytes, size_t len, uint32_t type_id = 0, bool has_type = false);
+  void emit_blob(uint32_t stream_id, Direction dir, int64_t ts_ns, uint32_t type_id,
+                 std::string_view payload);
   void handle_open(const CaptureItem& item);
   void handle_data(const CaptureItem& item);
   void handle_close(const CaptureItem& item);
@@ -102,6 +110,8 @@ class JsonWriter {
   std::string buffer_;
   std::atomic<uint64_t> events_{0};
   std::atomic<uint64_t> messages_{0};
+  std::atomic<uint64_t> blobs_{0};
+  std::atomic<uint64_t> blob_bytes_{0};
   std::atomic<uint64_t> unparsed_{0};
   std::atomic<uint64_t> parse_errors_{0};
   std::atomic<uint64_t> desynced_streams_{0};
