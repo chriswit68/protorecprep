@@ -19,61 +19,10 @@ endif()
 option(PRP_ASAN "Build with AddressSanitizer" OFF)
 option(PRP_TSAN "Build with ThreadSanitizer" OFF)
 option(PRP_BUILD_TESTS "Build tests" ON)
-option(PRP_STATIC "Linux: fully static executable; macOS: static third-party libraries" OFF)
-
-if(PRP_STATIC AND (PRP_ASAN OR PRP_TSAN))
-  message(FATAL_ERROR "PRP_STATIC cannot be combined with PRP_ASAN or PRP_TSAN")
-endif()
-
-# Prefer static archives on Linux. On macOS the system libraries only exist as
-# .tbd stubs, so the suffix restriction must not be applied there.
-if(PRP_STATIC AND NOT APPLE)
-  set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
-  set(THREADS_PREFER_PTHREAD_FLAG ON)
-endif()
 
 find_package(Threads REQUIRED)
 find_package(Boost 1.80 REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
-
-# Fail early when a static build silently picks up shared protobuf libraries:
-# a fully static Linux link would fail later with a confusing linker error and
-# macOS would produce a binary that still depends on Homebrew dylibs.
-if(PRP_STATIC)
-  foreach(_prp_target protobuf::libprotobuf protobuf::libprotoc)
-    set(_prp_locations)
-    get_target_property(_prp_configs ${_prp_target} IMPORTED_CONFIGURATIONS)
-    if(_prp_configs)
-      foreach(_prp_config ${_prp_configs})
-        get_target_property(_prp_location ${_prp_target} IMPORTED_LOCATION_${_prp_config})
-        if(_prp_location)
-          list(APPEND _prp_locations "${_prp_location}")
-        endif()
-      endforeach()
-    endif()
-    get_target_property(_prp_location ${_prp_target} IMPORTED_LOCATION)
-    if(_prp_location)
-      list(APPEND _prp_locations "${_prp_location}")
-    endif()
-    if(NOT _prp_locations)
-      message(FATAL_ERROR "Could not determine the imported location of ${_prp_target}")
-    endif()
-    foreach(_prp_location ${_prp_locations})
-      if(_prp_location MATCHES "\\.(dylib|so)(\\.|$)")
-        message(FATAL_ERROR
-          "${_prp_target} is shared (${_prp_location}). Configure against a static "
-          "dependency prefix, e.g. -DCMAKE_PREFIX_PATH=/opt/prp-static "
-          "(see doc/static-build.md).")
-      endif()
-    endforeach()
-  endforeach()
-endif()
-
-if(PRP_STATIC AND NOT APPLE)
-  add_link_options(-static)
-elseif(PRP_STATIC AND APPLE)
-  message(STATUS "PRP_STATIC: third-party libraries are static; libc++/libSystem remain dynamic")
-endif()
 
 add_library(prp_core
   src/prp/util/log.cpp
@@ -98,11 +47,9 @@ add_library(prp_core
 )
 target_include_directories(prp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(prp_core PUBLIC
-  # Protobuf/Abseil first: their include directories must win over a Homebrew
-  # prefix that also contains newer abseil headers (static builds).
+  Boost::headers
   protobuf::libprotobuf
   protobuf::libprotoc
-  Boost::headers
   Threads::Threads
 )
 target_compile_options(prp_core PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion)

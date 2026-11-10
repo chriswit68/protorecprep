@@ -31,25 +31,13 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "PRP_TSAN": "ON"
       }
-    },
-    {
-      "name": "static",
-      "displayName": "Static (Linux fully static / macOS static deps)",
-      "binaryDir": "${sourceDir}/build/static",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "PRP_STATIC": "ON",
-        "PRP_BUILD_TESTS": "OFF",
-        "CMAKE_PREFIX_PATH": "$env{PRP_STATIC_PREFIX}"
-      }
     }
   ],
   "buildPresets": [
     { "name": "default", "configurePreset": "default", "jobs": 12 },
     { "name": "debug", "configurePreset": "debug", "jobs": 12 },
     { "name": "asan", "configurePreset": "asan", "jobs": 12 },
-    { "name": "tsan", "configurePreset": "tsan", "jobs": 12 },
-    { "name": "static", "configurePreset": "static", "jobs": 12 }
+    { "name": "tsan", "configurePreset": "tsan", "jobs": 12 }
   ],
   "testPresets": [
     { "name": "default", "configurePreset": "default", "output": { "outputOnFailure": true } },
