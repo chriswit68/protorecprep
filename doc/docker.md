@@ -269,3 +269,8 @@ docker compose build
 Abseil und Protobuf müssen zueinander passen (Protobuf 36.2 erwartet
 Abseil 20250512.1). Beide werden mit C++17 gebaut; die Anwendung selbst
 verwendet C++20.
+
+## Weiterführende Dokumentation
+
+- [`../README.md`](../README.md) – Benutzerhandbuch und CLI-Referenz
+- [`software-design.md`](software-design.md) – arc42-Software-Design-Dokument

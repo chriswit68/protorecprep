@@ -10,6 +10,10 @@ Das Tool läuft unter macOS und Linux. Für Linux steht zusätzlich ein
 Docker-Image bereit, das die Anwendung inklusive Protobuf-, Protoc- und
 Abseil-Laufzeitbibliotheken enthält, sodass auf dem Host nur Docker nötig ist.
 
+Weiterführende Dokumentation: das [arc42-Software-Design-Dokument](doc/software-design.md)
+beschreibt Architektur, Laufzeitverhalten und Entscheidungen; das
+[Docker-Handbuch](doc/docker.md) behandelt Containerbetrieb und Multi-Arch-Builds.
+
 ## Überblick
 
 - **Vier Modi:** `record`, `replay`, `passthrough`, `inspect`
@@ -602,7 +606,7 @@ proto/sample.proto           # Beispielschema für Tests und Beispiele
 etc/                         # Beispielkonfigurationen
 tests/                       # Unit- und End-to-End-Tests
 bench/                       # Durchsatz-Benchmark
-doc/                         # weiterführende Dokumentation (Docker)
+doc/                         # Docker-Handbuch und arc42-Design-Dokument
 ```
 
 ## Fehlerbehebung
