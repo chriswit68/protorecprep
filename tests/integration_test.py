@@ -126,6 +126,34 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def jsonl_paths(session_dir: str) -> list[str]:
+    """Returns the JSONL files of a session.
+
+    By default the writer produces one capture-NNNNNN.jsonl per capture chunk;
+    an explicit --json-file produces a single events.jsonl.
+    """
+    chunks = sorted(
+        os.path.join(session_dir, name)
+        for name in os.listdir(session_dir)
+        if name.startswith("capture-") and name.endswith(".jsonl")
+    )
+    if chunks:
+        return chunks
+    single = os.path.join(session_dir, "events.jsonl")
+    return [single] if os.path.exists(single) else []
+
+
+def read_events(session_dir: str) -> list[dict]:
+    events = []
+    for path in jsonl_paths(session_dir):
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    events.append(json.loads(line))
+    return events
+
+
 def test_outbound(binary: str, proto: str, workdir: str, port: int) -> None:
     """Verifies configured server->client messages reach the wire and the capture."""
     out_dir = os.path.join(workdir, "out-send")
@@ -181,11 +209,9 @@ def test_outbound(binary: str, proto: str, workdir: str, port: int) -> None:
         check(meta["send"]["every_ms"] == 100, meta["send"])
 
         out_messages = []
-        with open(os.path.join(session_dir, "events.jsonl")) as fh:
-            for line in fh:
-                obj = json.loads(line)
-                if obj.get("dir") == "out":
-                    out_messages.append(obj)
+        for obj in read_events(session_dir):
+            if obj.get("dir") == "out":
+                out_messages.append(obj)
         check(len(out_messages) == 3, f"expected 3 recorded outbound messages, got {len(out_messages)}")
         for obj in out_messages:
             check(obj["type"] == "demo.TestRecord", obj)
@@ -278,6 +304,7 @@ def test_chunking_and_json_file(binary: str, proto: str, workdir: str) -> None:
             meta = json.load(fh)
         check(meta["chunk_interval_ms"] == 200, meta)
         check(meta["chunk_bytes"] == 0, meta)
+        check(meta["json_chunks"] is False, meta)
         check(meta["json_file"] == json_path, meta)
     finally:
         if proc.poll() is None:
@@ -333,6 +360,7 @@ def test_config_file_recording(binary: str, proto: str, workdir: str) -> None:
         check(meta["proto"] == proto, meta)
         check(meta["message_type"] == "demo.TestRecord", meta)
         check(meta["chunk_interval_ms"] == 60000, meta)
+        check(meta["json_chunks"] is False, meta)
         check(meta["json_file"] == os.path.join(session_dir, "config-events.jsonl"), meta)
 
         json_path = os.path.join(session_dir, "config-events.jsonl")
@@ -387,11 +415,9 @@ def test_raw_json(binary: str, proto: str, workdir: str, port: int) -> None:
         session_dir = os.path.join(out_dir, sessions[0])
 
         raw_events = []
-        with open(os.path.join(session_dir, "events.jsonl")) as fh:
-            for line in fh:
-                obj = json.loads(line)
-                if obj.get("unparsed") and "raw framing" in obj.get("reason", ""):
-                    raw_events.append(obj)
+        for obj in read_events(session_dir):
+            if obj.get("unparsed") and "raw framing" in obj.get("reason", ""):
+                raw_events.append(obj)
         check(bool(raw_events), "no raw framing fallback event")
         reassembled = b"".join(base64.b64decode(event["bytes_b64"]) for event in raw_events)
         check(reassembled == payload, f"raw JSON bytes mismatch: {len(reassembled)} != {len(payload)}")
@@ -519,7 +545,7 @@ def main() -> int:
         check(len(sessions) == 1, f"expected one session dir, got {sessions}")
         session_dir = os.path.join(out_dir, sessions[0])
 
-        for required in ("meta.json", "summary.json", "events.jsonl", "json-summary.json"):
+        for required in ("meta.json", "summary.json", "json-summary.json"):
             check(os.path.exists(os.path.join(session_dir, required)), f"missing {required}")
 
         captures = sorted(
@@ -527,6 +553,15 @@ def main() -> int:
         )
         check(len(captures) >= 2, f"expected rotation into multiple segments, got {captures}")
         check(all(os.path.getsize(os.path.join(session_dir, f)) > 0 for f in captures), "empty capture")
+
+        json_chunks = sorted(
+            f for f in os.listdir(session_dir) if f.startswith("capture-") and f.endswith(".jsonl")
+        )
+        check(bool(json_chunks), "missing chunked JSONL output")
+        check(
+            json_chunks == [f[:-4] + ".jsonl" for f in captures],
+            f"JSON chunks do not mirror capture chunks: {json_chunks} vs {captures}",
+        )
 
         with open(os.path.join(session_dir, "summary.json")) as fh:
             summary = json.load(fh)
@@ -536,26 +571,35 @@ def main() -> int:
         check(summary["dropped_items"] == 0, "items were dropped")
 
         messages = []
-        events = 0
-        with open(os.path.join(session_dir, "events.jsonl")) as fh:
-            for line in fh:
-                obj = json.loads(line)
-                events += 1
-                if "message" in obj:
-                    messages.append(obj)
+        all_events = []
+        for name in json_chunks:
+            segment = int(name[len("capture-") : -len(".jsonl")])
+            with open(os.path.join(session_dir, name)) as fh:
+                for line in fh:
+                    obj = json.loads(line)
+                    check(obj.get("segment") == segment, f"segment mismatch in {name}: {obj}")
+                    all_events.append(obj)
+                    if "message" in obj:
+                        messages.append(obj)
+        events = len(all_events)
         check(len(messages) == 50, f"expected 50 JSON messages, got {len(messages)}")
         types = {m["type"] for m in messages}
         check(types == {"demo.TestRecord"}, f"unexpected types: {types}")
         seqs = {str(m["message"].get("seq", 0)) for m in messages}
         check(seqs == {str(i) for i in range(50)}, "message sequence mismatch")
         check(any(m["message"]["name"].endswith("-49") for m in messages), "payload mismatch")
-        reasons = []
-        with open(os.path.join(session_dir, "events.jsonl")) as fh:
-            for line in fh:
-                obj = json.loads(line)
-                if obj.get("event") == "stream_close":
-                    reasons.append(obj.get("reason"))
+        reasons = [e.get("reason") for e in all_events if e.get("event") == "stream_close"]
         check("protocol_error" in reasons, f"oversized frame not rejected: {reasons}")
+
+        with open(os.path.join(session_dir, "json-summary.json")) as fh:
+            json_stats = json.load(fh)
+        check(json_stats["chunks_written"] == len(json_chunks), json_stats)
+        check(json_stats["chunk_open_errors"] == 0, json_stats)
+        check(
+            [chunk["segment"] for chunk in json_stats["chunks"]]
+            == [int(name[len("capture-") : -len(".jsonl")]) for name in json_chunks],
+            json_stats,
+        )
 
         inspect = subprocess.run(
             [binary, "inspect", "--dir", session_dir], capture_output=True, text=True, timeout=30

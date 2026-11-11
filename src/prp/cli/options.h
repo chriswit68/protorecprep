@@ -52,8 +52,16 @@ struct Options {
   rec::Framing framing = rec::Framing::VarintLength;
   bool json_enabled = false;
   // JSONL data file override. Relative paths are resolved against the session
-  // directory; empty selects "<session>/events.jsonl".
+  // directory; empty selects "<session>/events.jsonl". An explicit --json-file
+  // selects single-file mode.
   fs::path json_file;
+  bool json_file_set = false;
+  // Chunked JSONL (default when --json is active): one capture-NNNNNN.jsonl per
+  // capture chunk. --no-json-chunks disables it.
+  bool json_chunked = true;
+  bool json_chunks_set = false;
+  // Directory for chunked JSONL. Empty means the session directory.
+  fs::path json_dir;
   bool json_print_defaults = false;
   bool json_preserve_names = false;
   size_t max_frame = 16ull * 1024 * 1024;

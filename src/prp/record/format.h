@@ -24,6 +24,13 @@ enum class Framing : uint8_t { Raw = 0, VarintLength = 1, TypedLengthLE = 2 };
 const char* framing_name(Framing framing);
 bool parse_framing(std::string_view text, Framing& out);
 
+// Chunk naming shared by the binary recorder and the JSON sidecar. Keeping both
+// names derived from the same stem guarantees that capture-NNNNNN.pcr and
+// capture-NNNNNN.jsonl always refer to the same chunk.
+std::string segment_stem(uint32_t index);
+std::string segment_capture_name(uint32_t index);
+std::string segment_json_name(uint32_t index);
+
 enum class RecordType : uint8_t {
   StreamOpen = 1,
   Data = 2,

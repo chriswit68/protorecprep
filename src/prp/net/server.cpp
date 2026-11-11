@@ -98,7 +98,6 @@ class Session : public std::enable_shared_from_this<Session> {
 
   void submit(const ItemPtr& item) {
     const PushResult result = server_.recorder().submit(item);
-    if (server_.json()) server_.json()->submit(item);
     if (result == PushResult::Closed) {
       do_close(CloseReason::ServerShutdown);
     } else if (result == PushResult::Overflow) {
@@ -398,8 +397,8 @@ class Session : public std::enable_shared_from_this<Session> {
   bool finalized_ = false;
 };
 
-Server::Server(asio::io_context& io, ServerConfig config, Recorder& recorder, JsonWriter* json)
-    : io_(io), config_(std::move(config)), recorder_(recorder), json_(json), acceptor_(io) {}
+Server::Server(asio::io_context& io, ServerConfig config, Recorder& recorder)
+    : io_(io), config_(std::move(config)), recorder_(recorder), acceptor_(io) {}
 
 Server::~Server() = default;
 
@@ -436,9 +435,9 @@ bool Server::open(std::string& err) {
     err = "cannot listen: " + ec.message();
     return false;
   }
-  log_printf(LogLevel::Info, "listening on %s:%u (framing=%s, json=%s)",
+  log_printf(LogLevel::Info, "listening on %s:%u (framing=%s)",
              endpoint.address().to_string().c_str(), static_cast<unsigned>(endpoint.port()),
-             rec::framing_name(config_.framing), json_ ? "on" : "off");
+             rec::framing_name(config_.framing));
   return true;
 }
 

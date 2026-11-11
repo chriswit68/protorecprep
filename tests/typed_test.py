@@ -91,10 +91,20 @@ def stop(proc: subprocess.Popen, stderr_file, stderr_path: str) -> None:
 
 
 def read_events(out_dir: str) -> list[dict]:
+    paths = sorted(
+        os.path.join(out_dir, name)
+        for name in os.listdir(out_dir)
+        if name.startswith("capture-") and name.endswith(".jsonl")
+    )
+    if not paths:
+        paths = [os.path.join(out_dir, "events.jsonl")]
     events = []
-    with open(os.path.join(out_dir, "events.jsonl")) as fh:
-        for line in fh:
-            events.append(json.loads(line))
+    for path in paths:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    events.append(json.loads(line))
     return events
 
 

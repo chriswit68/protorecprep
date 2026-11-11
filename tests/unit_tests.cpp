@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -287,7 +289,7 @@ void test_chunk_and_json_options() {
   };
 
   {
-    // Defaults: one-minute chunks, no size cap, default JSON file name.
+    // Defaults: one-minute chunks, no size cap, chunked JSON when enabled.
     prp::Options options;
     std::string err;
     CHECK(parse({"protorecprep", "record", "--out", "/tmp/x"}, options, err));
@@ -295,9 +297,12 @@ void test_chunk_and_json_options() {
     CHECK_EQ(options.rotate_bytes, uint64_t{0});
     CHECK_EQ(options.json_file.string(), std::string());
     CHECK(!options.json_enabled);
+    CHECK(options.json_chunked);
+    CHECK(!options.json_file_set);
+    CHECK(!options.json_chunks_set);
   }
   {
-    // Chunk aliases and a custom JSON data file.
+    // Chunk aliases and a custom JSON data file (implicit single-file mode).
     prp::Options options;
     std::string err;
     CHECK(parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
@@ -306,8 +311,56 @@ void test_chunk_and_json_options() {
                 options, err));
     CHECK(options.json_enabled);
     CHECK_EQ(options.json_file.string(), std::string("custom.jsonl"));
+    CHECK(options.json_file_set);
+    CHECK(!options.json_chunked);
     CHECK_EQ(options.rotate_interval.count(), int64_t{30 * 1000});
     CHECK_EQ(options.rotate_bytes, uint64_t{4096});
+  }
+  {
+    // Explicit chunk flags and a chunk directory.
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                 "--message-type", "demo.A", "--json", "--json-chunks", "--json-dir", "json"},
+                options, err));
+    CHECK(options.json_enabled);
+    CHECK(options.json_chunked);
+    CHECK(options.json_chunks_set);
+    CHECK_EQ(options.json_dir.string(), std::string("json"));
+  }
+  {
+    // --no-json-chunks selects a single session-wide file.
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                 "--message-type", "demo.A", "--json", "--no-json-chunks"},
+                options, err));
+    CHECK(options.json_enabled);
+    CHECK(!options.json_chunked);
+    CHECK(options.json_chunks_set);
+  }
+  {
+    // --json-file and --json-chunks contradict each other.
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--message-type", "demo.A", "--json-file", "x.jsonl", "--json-chunks"},
+                 options, err));
+    CHECK(err.find("mutually exclusive") != std::string::npos);
+  }
+  {
+    // --json-dir only makes sense in chunk mode and needs JSON enabled.
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--message-type", "demo.A", "--json-dir", "json"},
+                 options, err));
+    CHECK(err.find("--json-dir requires --json") != std::string::npos);
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/x", "--proto", "sample.proto",
+                  "--message-type", "demo.A", "--json", "--json-file", "x.jsonl",
+                  "--json-dir", "json"},
+                 options, err));
+    CHECK(err.find("--json-dir requires JSON chunk mode") != std::string::npos);
   }
   {
     // Legacy rotate names remain supported.
@@ -327,6 +380,11 @@ void test_chunk_and_json_options() {
                  options, err));
     CHECK(err.find("--json requires --proto") != std::string::npos);
   }
+
+  // Capture and JSON chunk names share a stem by construction.
+  CHECK_EQ(prp::rec::segment_stem(7), std::string("capture-000007"));
+  CHECK_EQ(prp::rec::segment_capture_name(1), std::string("capture-000001.pcr"));
+  CHECK_EQ(prp::rec::segment_json_name(42), std::string("capture-000042.jsonl"));
 }
 
 void test_replay_options() {
@@ -767,6 +825,16 @@ void test_recorder_roundtrip() {
 
   prp::Recorder recorder(config);
   std::string err;
+
+  std::mutex observed_mutex;
+  std::vector<uint32_t> observed_segments;
+  std::vector<prp::ItemKind> observed_kinds;
+  recorder.set_item_observer([&](const prp::ItemPtr& item, uint32_t segment) {
+    std::lock_guard<std::mutex> lock(observed_mutex);
+    observed_segments.push_back(segment);
+    observed_kinds.push_back(item->kind);
+  });
+
   CHECK(recorder.start(err));
 
   constexpr uint32_t kStream = 7;
@@ -785,6 +853,22 @@ void test_recorder_roundtrip() {
   CHECK(!stats.failed);
   CHECK_EQ(stats.data_bytes, expected_bytes);
   CHECK(stats.segments > 1);
+
+  // The observer sees every appended item together with the segment that
+  // actually holds it. This is what keeps the JSON chunks aligned.
+  CHECK_EQ(observed_segments.size(), size_t{52});
+  if (!observed_segments.empty()) {
+    CHECK_EQ(observed_segments.front(), uint32_t{1});
+    CHECK_EQ(observed_segments.back(), static_cast<uint32_t>(stats.segments));
+    CHECK(observed_kinds.front() == prp::ItemKind::StreamOpen);
+    CHECK(observed_kinds.back() == prp::ItemKind::StreamClose);
+  }
+  std::set<uint32_t> seen_segments;
+  for (size_t i = 0; i < observed_segments.size(); ++i) {
+    if (i > 0) CHECK(observed_segments[i] >= observed_segments[i - 1]);
+    seen_segments.insert(observed_segments[i]);
+  }
+  CHECK_EQ(seen_segments.size(), stats.segments);
 
   std::vector<prp::ScanStats> results;
   CHECK(prp::recover_session_dir(dir, results, false, err));
@@ -1064,6 +1148,69 @@ void test_json_writer(const char* proto_path) {
   CHECK(content.find("\"dir\":\"out\"") != std::string::npos);
   CHECK(content.find("\"type\":\"demo.Nested\"") != std::string::npos);
   CHECK(content.find("\"messages\"") == std::string::npos);
+  CHECK(content.find("\"segment\":1") != std::string::npos);
+
+  std::filesystem::remove_all(dir);
+}
+
+void test_json_writer_chunks(const char* proto_path) {
+  const auto dir = make_temp_dir("json-chunks");
+  prp::Schema schema;
+  std::string err;
+  CHECK(schema.load(proto_path, {}, err));
+
+  google::protobuf::DynamicMessageFactory factory(schema.pool());
+  std::unique_ptr<google::protobuf::Message> message(
+      factory.GetPrototype(schema.find_message("demo.TestRecord"))->New());
+  CHECK(prp::json_to_message("{\"seq\":5,\"name\":\"chunked\"}", *message, false, err));
+  std::string serialized;
+  CHECK(message->SerializeToString(&serialized));
+  const std::string wire = prp::frame_message(serialized);
+
+  prp::JsonWriterConfig config;
+  config.chunked = true;
+  config.chunk_dir = dir;
+  config.schema = &schema;
+  config.default_type_name = "demo.TestRecord";
+  config.framing = prp::rec::Framing::VarintLength;
+  prp::JsonWriter writer(config);
+  CHECK(writer.start(err));
+
+  writer.submit(prp::make_stream_open(1, prp::now_wall_ns(), "peer:1", "demo.TestRecord"), 1);
+  writer.submit(prp::make_data(1, prp::Direction::In, prp::now_wall_ns(),
+                               std::vector<uint8_t>(wire.begin(), wire.end())),
+                1);
+  // Simulate a recorder rotation: the next items belong to chunk 2.
+  writer.submit(prp::make_data(1, prp::Direction::In, prp::now_wall_ns(),
+                               std::vector<uint8_t>(wire.begin(), wire.end())),
+                2);
+  writer.submit(prp::make_stream_close(1, prp::CloseReason::PeerClosed, prp::now_wall_ns()), 2);
+  writer.stop();
+
+  const auto stats = writer.stats();
+  CHECK(!stats.failed);
+  CHECK_EQ(stats.chunks, 2ull);
+  CHECK_EQ(stats.chunk_open_errors, 0ull);
+  CHECK_EQ(stats.chunk_infos.size(), size_t{2});
+  if (stats.chunk_infos.size() == 2) {
+    CHECK_EQ(stats.chunk_infos[0].segment, uint32_t{1});
+    CHECK_EQ(stats.chunk_infos[1].segment, uint32_t{2});
+    CHECK(stats.chunk_infos[0].events > 0);
+    CHECK(stats.chunk_infos[1].events > 0);
+    CHECK_EQ(stats.chunk_infos[0].path, (dir / "capture-000001.jsonl").string());
+    CHECK_EQ(stats.chunk_infos[1].path, (dir / "capture-000002.jsonl").string());
+  }
+
+  std::string first;
+  std::string second;
+  CHECK(prp::read_file(dir / "capture-000001.jsonl", first, err));
+  CHECK(prp::read_file(dir / "capture-000002.jsonl", second, err));
+  CHECK(first.find("\"segment\":1") != std::string::npos);
+  CHECK(first.find("stream_open") != std::string::npos);
+  CHECK(first.find("chunked") != std::string::npos);
+  CHECK(second.find("\"segment\":2") != std::string::npos);
+  CHECK(second.find("stream_close") != std::string::npos);
+  CHECK(second.find("\"segment\":1") == std::string::npos);
 
   std::filesystem::remove_all(dir);
 }
@@ -1240,6 +1387,7 @@ int main(int argc, char** argv) {
   if (with_proto) {
     test_schema(proto);
     test_json_writer(proto);
+    test_json_writer_chunks(proto);
     test_typed_json_writer(proto);
   }
 

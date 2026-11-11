@@ -79,7 +79,8 @@ bool resolve_type_map(const std::map<uint32_t, std::string>& input, const std::s
 }
 
 std::string meta_json(const Options& options, const Schema& schema, const fs::path& session_dir,
-                      const fs::path& json_path, const std::string& session_id, const SendSpec& send,
+                      const fs::path& json_path, bool json_chunked, const fs::path& json_dir,
+                      const std::string& session_id, const SendSpec& send,
                       const ForwardConfig& forward,
                       const std::map<uint32_t, std::string>& type_map,
                       const std::set<uint32_t>& file_types, const fs::path& files_dir) {
@@ -113,7 +114,14 @@ std::string meta_json(const Options& options, const Schema& schema, const fs::pa
   }
   json += "  \"json\": " + std::string(options.json_enabled ? "true" : "false") + ",\n";
   if (options.json_enabled) {
-    json += "  \"json_file\": \"" + json_escape(json_path.string()) + "\",\n";
+    if (json_chunked) {
+      json += "  \"json_chunks\": true,\n";
+      json += "  \"json_dir\": \"" + json_escape(json_dir.string()) + "\",\n";
+      json += "  \"json_chunk_pattern\": \"capture-%06u.jsonl\",\n";
+    } else {
+      json += "  \"json_chunks\": false,\n";
+      json += "  \"json_file\": \"" + json_escape(json_path.string()) + "\",\n";
+    }
   }
   json += "  \"max_frame\": " + std::to_string(options.max_frame) + ",\n";
   json += "  \"max_connections\": " + std::to_string(options.max_connections) + ",\n";
@@ -162,6 +170,17 @@ void write_json_summary(const JsonWriter& writer, const fs::path& dir) {
   json += "  \"desynced_streams\": " + std::to_string(s.desynced_streams) + ",\n";
   json += "  \"skipped_data_items\": " + std::to_string(s.skipped_data_items) + ",\n";
   json += "  \"bytes_written\": " + std::to_string(s.bytes_written) + ",\n";
+  json += "  \"chunks_written\": " + std::to_string(s.chunks) + ",\n";
+  json += "  \"chunk_open_errors\": " + std::to_string(s.chunk_open_errors) + ",\n";
+  json += "  \"chunks\": [";
+  for (size_t i = 0; i < s.chunk_infos.size(); ++i) {
+    const JsonChunkInfo& chunk = s.chunk_infos[i];
+    if (i != 0) json += ", ";
+    json += "{\"segment\": " + std::to_string(chunk.segment) + ", \"file\": \"" +
+            json_escape(chunk.path) + "\", \"events\": " + std::to_string(chunk.events) +
+            ", \"bytes\": " + std::to_string(chunk.bytes) + "}";
+  }
+  json += "],\n";
   json += std::string("  \"failed\": ") + (s.failed ? "true" : "false") + ",\n";
   json += "  \"error\": \"" + json_escape(writer.last_error()) + "\"\n";
   json += "}\n";
@@ -314,15 +333,25 @@ int run_server_mode(const Options& options, std::string& err) {
 
   Recorder recorder(recorder_config);
 
-  // JSON output is a single file for the whole session; the path is
-  // configurable. Relative paths stay inside the session directory so all
-  // artifacts travel together.
+  // JSON output defaults to one file per capture chunk (capture-NNNNNN.jsonl)
+  // so events can be matched to their binary chunk. An explicit --json-file
+  // switches to a single session-wide file instead.
   fs::path json_path;
+  fs::path json_dir;
+  const bool json_chunked = options.json_enabled && options.json_chunked;
   if (options.json_enabled) {
-    json_path = options.json_file.empty() ? fs::path("events.jsonl") : options.json_file;
-    if (json_path.is_relative()) json_path = session_dir / json_path;
-    if (!json_path.parent_path().empty() && !ensure_directory(json_path.parent_path(), err)) {
-      return fail("cannot create JSON output directory: " + err);
+    if (json_chunked) {
+      json_dir = options.json_dir.empty() ? session_dir : options.json_dir;
+      if (json_dir.is_relative()) json_dir = session_dir / json_dir;
+      if (!ensure_directory(json_dir, err)) {
+        return fail("cannot create JSON chunk directory: " + err);
+      }
+    } else {
+      json_path = options.json_file.empty() ? fs::path("events.jsonl") : options.json_file;
+      if (json_path.is_relative()) json_path = session_dir / json_path;
+      if (!json_path.parent_path().empty() && !ensure_directory(json_path.parent_path(), err)) {
+        return fail("cannot create JSON output directory: " + err);
+      }
     }
   }
 
@@ -341,6 +370,8 @@ int run_server_mode(const Options& options, std::string& err) {
   if (options.json_enabled) {
     JsonWriterConfig json_config;
     json_config.output_path = json_path;
+    json_config.chunked = json_chunked;
+    json_config.chunk_dir = json_dir;
     json_config.schema = &schema;
     json_config.default_type_name = default_type_name;
     json_config.proto_package = options.proto_package;
@@ -375,10 +406,11 @@ int run_server_mode(const Options& options, std::string& err) {
     server_config.forward.queue_limit = options.forward_queue;
   }
 
-  Server server(io, server_config, recorder, json.get());
+  Server server(io, server_config, recorder);
 
-  const std::string meta = meta_json(options, schema, session_dir, json_path, session_id, send,
-                                     server_config.forward, type_map, options.file_types, files_dir);
+  const std::string meta = meta_json(options, schema, session_dir, json_path, json_chunked, json_dir,
+                                     session_id, send, server_config.forward, type_map,
+                                     options.file_types, files_dir);
   if (!write_file_atomic(session_dir / "meta.json", meta, err)) {
     log_error("could not write meta.json: " + err);
     return 2;
@@ -388,6 +420,16 @@ int run_server_mode(const Options& options, std::string& err) {
     log_error("fatal recorder error: " + error);
     asio::post(io, [&server] { server.shutdown(); });
   });
+
+  // The recorder is authoritative for chunk boundaries. Every item it appends
+  // is mirrored to the JSON sidecar with the segment index it was written to,
+  // so capture-NNNNNN.pcr and capture-NNNNNN.jsonl stay aligned.
+  if (json) {
+    JsonWriter* json_ptr = json.get();
+    recorder.set_item_observer([json_ptr](const ItemPtr& item, uint32_t segment) {
+      json_ptr->submit(item, segment);
+    });
+  }
 
   if (!recorder.start(err)) {
     log_error("cannot start recorder: " + err);

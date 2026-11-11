@@ -142,16 +142,46 @@ JSONL-Sidecar als `unparsed` mit `type_id`, die Binäraufnahme bleibt
 byte-genau (inklusive Header) und damit replayfähig:
 
 ```json
-{"seq":3,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
+{"seq":3,"segment":1,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
  "unparsed":true,"reason":"unknown message type id 7","type_id":7}
 ```
 
 Bekannte Typen werden mit lesbarem Namen und ID ausgegeben:
 
 ```json
-{"seq":2,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
+{"seq":2,"segment":1,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
  "type":"demo.TestRecord","type_id":1,"message":{"seq":"1","name":"hello"}}
 ```
+
+### JSON-Chunks
+
+Standardmäßig schreibt `--json` eine JSONL-Datei pro Capture-Chunk. Die
+Dateien teilen sich den Stamm und liegen im Session-Verzeichnis:
+
+```text
+/data/recordings/session-.../capture-000001.pcr
+/data/recordings/session-.../capture-000001.jsonl
+/data/recordings/session-.../capture-000002.pcr
+/data/recordings/session-.../capture-000002.jsonl
+```
+
+Damit ist jedes Event ohne Zeitstempel-Suche dem passenden Binär-Chunk
+zugeordnet. Zusätzlich trägt jedes Event `"segment": N`. Der Recorder
+bestimmt die Grenzen und meldet sie über den `ItemObserver` an den
+JsonWriter; der JSON-Writer rotiert nicht eigenständig.
+
+Einzeldatei-Modus (eine sessionweite Datei):
+
+```bash
+docker compose run --rm --service-ports protorecprep \
+  record --config etc/docker.ini --no-json-chunks
+```
+
+`--json-file <pfad>` impliziert ebenfalls den Einzeldatei-Modus und ist mit
+`--json-chunks` nicht kombinierbar. `--json-dir <dir>` legt die Chunk-Dateien
+in ein separates Verzeichnis innerhalb der Session. Die Chunkliste und
+Fehlerzähler stehen in `json-summary.json` (`chunks_written`,
+`chunk_open_errors`, `chunks[]`).
 
 ### Datei-/Blob-Kanäle (`@file`)
 
@@ -172,7 +202,7 @@ atomar unter `<session>/files/<seq>-<kind>.<ext>` geschrieben.
 Im JSONL-Sidecar bleibt das Event klein; es enthält nur Metadaten:
 
 ```json
-{"seq":48,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
+{"seq":48,"segment":1,"ts_ns":1760000000000000000,"stream":1,"dir":"in",
  "type":"@file","type_id":3,
  "blob":{"kind":"pcap","size":388,"sha256":"…",
          "path":"…/files/48-pcap.pcap","prefix":1}}
@@ -209,7 +239,8 @@ docker compose logs -f
 
 Danach einen Client mit dem erwarteten Framing an `localhost:5000`
 verbinden. Nach dem Beenden muss unter `recordings/` ein
-`session-*`-Verzeichnis mit Capture-Dateien liegen.
+`session-*`-Verzeichnis mit Capture-Dateien liegen. Bei aktivem JSON
+(`etc/docker.ini`) liegen daneben gleichnamige `capture-NNNNNN.jsonl`-Chunks.
 
 ## Laufzeitbibliotheken
 

@@ -144,19 +144,78 @@ bool JsonWriter::start(std::string& err) {
       return false;
     }
   }
-  file_ = std::fopen(config_.output_path.c_str(), "wb");
-  if (!file_) {
-    started_.store(false);
-    err = "cannot open " + config_.output_path.string() + ": " + std::strerror(errno);
-    return false;
+  if (config_.chunked) {
+    // Open the first chunk eagerly so an empty session still has a JSON file.
+    if (!open_chunk(config_.first_segment, err)) {
+      started_.store(false);
+      return false;
+    }
+  } else {
+    file_ = std::fopen(config_.output_path.c_str(), "wb");
+    if (!file_) {
+      started_.store(false);
+      err = "cannot open " + config_.output_path.string() + ": " + std::strerror(errno);
+      return false;
+    }
+    current_segment_ = config_.first_segment;
+    chunk_path_ = config_.output_path.string();
   }
   if (config_.schema && config_.schema->loaded()) {
     factory_ = std::make_unique<google::protobuf::DynamicMessageFactory>(config_.schema->pool());
   }
   last_flush_ = std::chrono::steady_clock::now();
   thread_ = std::thread([this] { run(); });
-  log_printf(LogLevel::Info, "json writer started: %s", config_.output_path.c_str());
+  log_printf(LogLevel::Info, "json writer started: %s",
+             config_.chunked ? (config_.chunk_dir / rec::segment_json_name(config_.first_segment)).c_str()
+                             : config_.output_path.c_str());
   return true;
+}
+
+bool JsonWriter::open_chunk(uint32_t segment, std::string& err) {
+  const fs::path path = config_.chunk_dir / rec::segment_json_name(segment);
+  FILE* file = std::fopen(path.c_str(), "wb");
+  if (!file) {
+    err = "cannot open " + path.string() + ": " + std::strerror(errno);
+    chunk_open_errors_.fetch_add(1, std::memory_order_relaxed);
+    log_printf(LogLevel::Warn, "json chunk %u: %s", segment, err.c_str());
+    return false;
+  }
+  file_ = file;
+  current_segment_ = segment;
+  chunk_path_ = path.string();
+  chunk_start_events_ = events_.load(std::memory_order_relaxed);
+  chunk_bytes_ = 0;
+  log_printf(LogLevel::Debug, "json chunk %s opened", path.c_str());
+  return true;
+}
+
+void JsonWriter::close_chunk() {
+  if (!file_) return;
+  flush_buffer(true);
+  std::fclose(file_);
+  file_ = nullptr;
+  JsonChunkInfo info;
+  info.segment = current_segment_;
+  info.path = chunk_path_;
+  info.events = events_.load(std::memory_order_relaxed) - chunk_start_events_;
+  info.bytes = chunk_bytes_;
+  {
+    std::lock_guard<std::mutex> lock(chunk_mutex_);
+    chunk_infos_.push_back(info);
+  }
+  chunk_path_.clear();
+  chunk_bytes_ = 0;
+}
+
+void JsonWriter::ensure_chunk(uint32_t segment) {
+  if (segment == current_segment_) return;
+  close_chunk();
+  std::string err;
+  if (!open_chunk(segment, err)) {
+    // Remember the failed segment so a broken directory does not trigger one
+    // attempt per item. A later chunk starts a fresh attempt.
+    current_segment_ = segment;
+  }
 }
 
 void JsonWriter::stop() {
@@ -179,7 +238,13 @@ JsonWriterStats JsonWriter::stats() const {
   s.desynced_streams = desynced_streams_.load(std::memory_order_relaxed);
   s.skipped_data_items = skipped_data_items_.load(std::memory_order_relaxed);
   s.bytes_written = bytes_written_.load(std::memory_order_relaxed);
+  s.chunk_open_errors = chunk_open_errors_.load(std::memory_order_relaxed);
   s.failed = failed_.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(chunk_mutex_);
+    s.chunk_infos = chunk_infos_;
+    s.chunks = chunk_infos_.size();
+  }
   return s;
 }
 
@@ -237,6 +302,8 @@ void JsonWriter::prepare_channel(StreamState& state, uint32_t stream_id, bool ou
 void JsonWriter::emit_event_prefix(const char* event, uint32_t stream_id, int64_t ts_ns) {
   buffer_ += "{\"seq\":";
   buffer_ += std::to_string(++seq_);
+  buffer_ += ",\"segment\":";
+  buffer_ += std::to_string(current_segment_);
   buffer_ += ",\"ts_ns\":";
   buffer_ += std::to_string(ts_ns);
   buffer_ += ",\"event\":\"";
@@ -256,6 +323,8 @@ void JsonWriter::emit_message(uint32_t stream_id, Direction dir, int64_t ts_ns, 
   }
   buffer_ += "{\"seq\":";
   buffer_ += std::to_string(++seq_);
+  buffer_ += ",\"segment\":";
+  buffer_ += std::to_string(current_segment_);
   buffer_ += ",\"ts_ns\":";
   buffer_ += std::to_string(ts_ns);
   buffer_ += ",\"stream\":";
@@ -280,6 +349,8 @@ void JsonWriter::emit_unparsed(uint32_t stream_id, Direction dir, int64_t ts_ns,
                                const uint8_t* bytes, size_t len, uint32_t type_id, bool has_type) {
   buffer_ += "{\"seq\":";
   buffer_ += std::to_string(++seq_);
+  buffer_ += ",\"segment\":";
+  buffer_ += std::to_string(current_segment_);
   buffer_ += ",\"ts_ns\":";
   buffer_ += std::to_string(ts_ns);
   buffer_ += ",\"stream\":";
@@ -342,6 +413,8 @@ void JsonWriter::emit_blob(uint32_t stream_id, Direction dir, int64_t ts_ns, uin
 
   buffer_ += "{\"seq\":";
   buffer_ += std::to_string(++seq_);
+  buffer_ += ",\"segment\":";
+  buffer_ += std::to_string(current_segment_);
   buffer_ += ",\"ts_ns\":";
   buffer_ += std::to_string(ts_ns);
   buffer_ += ",\"stream\":";
@@ -567,6 +640,7 @@ void JsonWriter::flush_buffer(bool force) {
                  std::strerror(errno));
     } else {
       bytes_written_.fetch_add(n, std::memory_order_relaxed);
+      chunk_bytes_ += n;
       std::fflush(file_);
     }
   }
@@ -578,8 +652,17 @@ void JsonWriter::flush_buffer(bool force) {
 void JsonWriter::run() {
   int since_flush = 0;
   while (true) {
-    ItemPtr item = queue_.pop();
-    if (!item) break;
+    JsonQueueItem entry = queue_.pop();
+    if (!entry.item) break;
+    const ItemPtr& item = entry.item;
+
+    // Mirror the capture chunk series. In single-file mode the segment is still
+    // recorded per event, but the file never rotates.
+    if (config_.chunked) {
+      ensure_chunk(entry.segment);
+    } else {
+      current_segment_ = entry.segment;
+    }
 
     if ((item->kind == ItemKind::Data || item->kind == ItemKind::StreamClose) &&
         take_desynced(item->stream_id)) {
@@ -612,17 +695,22 @@ void JsonWriter::run() {
       since_flush = 0;
     }
   }
-  flush_buffer(true);
-  if (file_) {
-    std::fclose(file_);
-    file_ = nullptr;
+  if (config_.chunked) {
+    close_chunk();
+  } else {
+    flush_buffer(true);
+    if (file_) {
+      std::fclose(file_);
+      file_ = nullptr;
+    }
   }
   const JsonWriterStats s = stats();
   log_printf(LogLevel::Info,
              "json writer stopped: events=%" PRIu64 " messages=%" PRIu64 " blobs=%" PRIu64
-             " unparsed=%" PRIu64 " dropped=%" PRIu64 " desynced=%" PRIu64 " bytes=%" PRIu64,
+             " unparsed=%" PRIu64 " dropped=%" PRIu64 " desynced=%" PRIu64 " chunks=%" PRIu64
+             " bytes=%" PRIu64,
              s.events, s.messages, s.blobs, s.unparsed, s.dropped_items, s.desynced_streams,
-             s.bytes_written);
+             s.chunks, s.bytes_written);
 }
 
 }  // namespace prp

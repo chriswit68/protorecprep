@@ -59,6 +59,13 @@ class Recorder {
   BoundedItemQueue& queue() { return queue_; }
   PushResult submit(const ItemPtr& item);
 
+  // Invoked from the recorder writer thread for every item that was appended to
+  // the capture, together with the effective chunk/segment index. The JSON
+  // sidecar uses this to mirror capture chunks exactly. The callback must not
+  // block.
+  using ItemObserver = std::function<void(const ItemPtr& item, uint32_t segment)>;
+  void set_item_observer(ItemObserver observer);
+
   // Invoked once from the writer thread when an unrecoverable write error
   // occurs. Must be thread-safe and should only schedule shutdown.
   void set_fatal_callback(std::function<void(std::string)> callback);
@@ -111,6 +118,8 @@ class Recorder {
   std::string error_;
   std::mutex callback_mutex_;
   std::function<void(std::string)> fatal_callback_;
+  std::mutex observer_mutex_;
+  ItemObserver observer_;
 };
 
 }  // namespace prp

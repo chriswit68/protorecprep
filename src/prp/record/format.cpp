@@ -1,5 +1,6 @@
 #include "prp/record/format.h"
 
+#include <cstdio>
 #include <cstring>
 
 #include "prp/util/bytes.h"
@@ -26,6 +27,16 @@ const char* framing_name(Framing framing) {
   }
   return "unknown";
 }
+
+std::string segment_stem(uint32_t index) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "capture-%06u", index);
+  return buf;
+}
+
+std::string segment_capture_name(uint32_t index) { return segment_stem(index) + ".pcr"; }
+
+std::string segment_json_name(uint32_t index) { return segment_stem(index) + ".jsonl"; }
 
 bool parse_framing(std::string_view text, Framing& out) {
   if (text == "raw") {

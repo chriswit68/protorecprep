@@ -64,7 +64,7 @@ Anwendungsprozess abstürzt.
 | FR-09 | Live-Weiterleitung mit gleichzeitiger Aufzeichnung | `SessionForwarder`, Passthrough-Modus |
 | FR-10 | Chunking nach Größe und/oder Zeit | `Recorder::maybe_rotate()` |
 | FR-11 | Crash-Erkennung und Reparatur | Trailer, CRC32C, `inspect --truncate` |
-| FR-12 | Lesbares JSONL-Sidecar mit Fehlerdiagnose | `JsonWriter`, `events.jsonl` |
+| FR-12 | Lesbares JSONL-Sidecar mit Fehlerdiagnose, je Capture-Chunk eine Datei | `JsonWriter`, `capture-NNNNNN.jsonl` |
 | FR-13 | Ausgehende Nachrichten an Clients | `SendSpec`, Timer, `frame_message()`/`frame_typed_message()` |
 | FR-14 | Betrieb im Container ohne Host-Abhängigkeiten | `Dockerfile`, `compose.yaml`, `etc/docker.ini` |
 | FR-15 | Schema-Validierung beim Replay | SHA-256 im Datei-Header, `ReplayRunner::validate_schema()` |
@@ -256,7 +256,7 @@ flowchart TB
   SESSION --> QUEUE
   QUEUE --> REC
   REC --> FORMAT
-  SESSION --> JSON
+  REC -->|"ItemObserver (Segment)"| JSON
   JSON --> SCHEMA
   FWD --> CLIENT
   REPLAY --> READER
@@ -277,6 +277,7 @@ flowchart TB
 | S8 | **Eigenes, versioniertes Capture-Format** | pcap passt nicht zu beliebigen Protobuf-Strömen | PCRP mit Magic, Version, Schema-Digest, CRC32C und Trailer |
 | S9 | **Zeitgetreues Replay mit Rückstau-Schutz** | Echtzeitverhalten testen, ohne Bursts zu erzeugen | Monotone Timeline, `--speed`, `--max-gap`, High-Water-Marks |
 | S10 | **Forwarding ist optional und isoliert** | Passthrough darf Aufzeichnung nie gefährden | `SessionForwarder` mit eigenen Fehler-Callbacks; Source-Stream bleibt offen |
+| S11 | **JSON-Chunks folgen den Capture-Chunks** | Ohne gemeinsame Grenzen ist die Zuordnung nur über Zeitstempel möglich | Recorder meldet Item + Segmentindex per Observer; Dateinamen teilen den Stamm |
 | S11 | **Konfiguration vor Laufzeit prüfen** | Fehler früh und klar melden | `validate_options()` vor dem Start; Exit-Code 2 |
 | S12 | **Betrieb als einzelnes Binary** | Einfacher Transport und Containerbetrieb | Keine externen Dienste; nur Dateisystem und TCP |
 
@@ -308,7 +309,7 @@ flowchart TB
 | Recorder | Persistenz, CRC, Rotation, fsync, Statistik | `src/prp/record/recorder.cpp`, `recorder.h` |
 | Capture-Format | Header-/Record-Kodierung und -Dekodierung | `src/prp/record/format.cpp`, `format.h` |
 | Capture-Reader | Sequenzielles Lesen, Scan, Recovery | `src/prp/record/reader.cpp`, `reader.h` |
-| JSON-Sidecar | Dekodierung, Blob-Extraktion, JSONL-Ausgabe | `src/prp/json/json_writer.cpp`, `json_writer.h` |
+| JSON-Sidecar | Dekodierung, Blob-Extraktion, JSONL-Chunks je Capture-Chunk | `src/prp/json/json_writer.cpp`, `json_writer.h` |
 | Schema | `.proto` laden, Descriptor-Set, Digest | `src/prp/proto/schema.cpp`, `schema.h` |
 | Core | Items, Richtungen, Close-Gründe, Queue | `src/prp/core/` |
 | Forwarding/Client | Asynchroner TCP-Client und Weiterleitung | `src/prp/net/client.cpp`, `forwarder.cpp` |
@@ -354,7 +355,7 @@ CRC32C, schreibt in einen Batch und rotiert Segmente. Der Recorder schreibt
 `summary.json` und meldet fatale Schreibfehler über einen Callback an die
 Anwendung, die daraufhin ein sauberes Shutdown einleitet.
 
-#### 5.2.4 JSON-Sidecar und Blobs
+#### 5.2.4 JSON-Sidecar, Chunks und Blobs
 
 Der JsonWriter läuft in einem eigenen Thread und besitzt eine eigene,
 nicht blockierende Queue. Bei Überlauf wird das Item verworfen, der betroffene
@@ -362,6 +363,26 @@ Stream als desynchronisiert markiert und im JSONL dokumentiert. Die
 Binäraufnahme ist davon nicht betroffen. Im Typed-Framing löst der Writer
 jeden Frame über `type_map` bzw. `file_types` auf, dekodiert Protobuf oder
 extrahiert einen Blob.
+
+Ist `--json` aktiv, schreibt der Writer standardmäßig **einen JSONL-Chunk pro
+Capture-Chunk**. Der Recorder ist für die Chunk-Grenzen autoritativ: Nach
+jedem erfolgreichen `append_record()` ruft er den registrierten
+`ItemObserver` mit dem Item und dem Segmentindex auf, in dem der Record
+tatsächlich gelandet ist. Der JsonWriter übernimmt diesen Index, statt
+unabhängig zu rotieren. Dadurch heißen korrespondierende Dateien gleich und
+enthalten dieselben Items:
+
+```text
+capture-000001.pcr  ↔  capture-000001.jsonl
+capture-000002.pcr  ↔  capture-000002.jsonl
+```
+
+Jedes Event trägt zusätzlich `"segment": N`. `seq` bleibt global über die
+Session; ein Frame über einer Chunk-Grenze gehört zu dem Segment, das ihn
+vervollständigt. Chunk 1 wird bereits in `JsonWriter::start()` geöffnet, damit
+auch eine leere Session eine JSONL-Datei besitzt. `--no-json-chunks` bzw. ein
+explizites `--json-file` schalten auf eine einzige sessionweite Datei um;
+`--json-dir` legt die Chunk-Dateien in ein separates Verzeichnis.
 
 #### 5.2.5 Schema
 
@@ -400,9 +421,8 @@ Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch.
 
 - **Verantwortung:** Annahme von Verbindungen, Verwaltung der Sessions,
   koordiniertes Shutdown, Aggregation der Forwarding-Statistik.
-- **Zustand:** `ServerConfig`, Referenz auf `Recorder`, optionaler
-  `JsonWriter*`, Acceptor, Session-Map, Atomare Zähler,
-  `stopped_callback_`.
+- **Zustand:** `ServerConfig`, Referenz auf `Recorder`, Acceptor, Session-Map,
+  Atomare Zähler, `stopped_callback_`.
 - **Wichtige Methoden:** `open()`, `start()`, `shutdown()`,
   `on_session_closed()`, `fire_stopped()`, `forward_stats()`,
   `note_forward_result()`.
@@ -432,23 +452,26 @@ Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch.
 - **Verantwortung:** Dauerhafte, CRC-gesicherte Binäraufnahme.
 - **Zustand:** `RecorderConfig`, `BoundedItemQueue`, Writer-Thread, Datei-
   deskriptor, Segmentindex/-größe, Batch-Puffer, aktive Streams, Statistiken,
-  Fehlerzustand.
-- **Wichtige Methoden:** `start()`, `stop()`, `submit()`, `run()`,
-  `open_segment()`, `close_segment()`, `append_record()`,
+  Fehlerzustand, optionaler `ItemObserver`.
+- **Wichtige Methoden:** `start()`, `stop()`, `submit()`, `set_item_observer()`,
+  `run()`, `open_segment()`, `close_segment()`, `append_record()`,
   `maybe_rotate()`, `ensure_synced()`, `write_summary()`, `fail()`.
 - **Invarianten:** Pro Segment genau ein Header; der Trailer wird nur bei
   sauberem Abschluss geschrieben; CRC32C wird über den Payload berechnet;
   ein Segment wird erst nach `fsync` geschlossen; ein Schreibfehler wird
-  einmalig als fatal gemeldet.
+  einmalig als fatal gemeldet. Der Observer sieht jedes erfolgreich
+  geschriebene Item genau einmal mit dem Segment, in dem es liegt.
 - **Threading:** Nur der Writer-Thread führt Datei-I/O aus. `submit()` ist
   MPSC-sicher.
 
-#### `BoundedItemQueue` (`prp::BoundedItemQueue`)
+#### `BoundedQueue<T>` / `BoundedItemQueue` (`prp::BoundedQueue`, `prp::BoundedItemQueue`)
 
 - **Verantwortung:** Speicherbegrenzte MPSC-Queue mit einstellbarer
-  Überlaufpolitik.
-- **Zustand:** `std::deque<ItemPtr>`, Mutex, zwei Condition Variables,
-  Byte-Buchhaltung, Statistiken.
+  Überlaufpolitik. `BoundedItemQueue` ist der Alias für `CaptureItem`; der
+  JsonWriter verwendet `BoundedQueue<JsonQueueItem>` mit Segmentindex.
+- **Zustand:** `std::deque<T>`, Mutex, zwei Condition Variables,
+  Byte-Buchhaltung, Statistiken; die Buchhaltung kommt aus
+  `QueueItemTraits<T>` (`accounted_bytes()`, `empty()`).
 - **Wichtige Methoden:** `push()`, `pop()`, `close()`, `stats()`,
   `buffered_bytes()`, `set_max_bytes()`.
 - **Invarianten:** Die Byte-Buchhaltung entspricht der Summe der
@@ -498,15 +521,19 @@ Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch.
 
 - **Verantwortung:** Asynchrone Umwandlung von Capture-Items in JSONL,
   Typauflösung, Fehlerdiagnose, Blob-Extraktion.
-- **Zustand:** Config, eigene Drop-Queue, Thread, Datei, Puffer,
-  per-Stream-Zustand (Reader, Descriptor, Message, Typ-Map-Cache),
-  Desync-Set, Statistiken.
-- **Wichtige Methoden:** `start()`, `stop()`, `submit()`, `run()`,
-  `handle_open()`, `handle_data()`, `handle_close()`, `emit_message()`,
-  `emit_unparsed()`, `emit_blob()`, `prepare_channel()`.
+- **Zustand:** Config, eigene Drop-Queue (`BoundedQueue<JsonQueueItem>` mit
+  Segmentindex), Thread, aktuelle Chunk-Datei, Puffer, per-Stream-Zustand
+  (Reader, Descriptor, Message, Typ-Map-Cache), Desync-Set, Chunk-Statistik,
+  Statistiken.
+- **Wichtige Methoden:** `start()`, `stop()`, `submit(item, segment)`, `run()`,
+  `open_chunk()`, `close_chunk()`, `ensure_chunk()`, `handle_open()`,
+  `handle_data()`, `handle_close()`, `emit_message()`, `emit_unparsed()`,
+  `emit_blob()`, `prepare_channel()`.
 - **Invarianten:** Nie blockierend; bei Überlauf wird der Stream
   desynchronisiert; bekannte Binär-Blobs werden nicht zusätzlich base64-
-  kodiert; Blob-Dateien werden atomar geschrieben.
+  kodiert; Blob-Dateien werden atomar geschrieben; im Chunk-Modus entspricht
+  die Datei dem vom Recorder gemeldeten Segment und jedes Event trägt
+  `"segment": N`.
 - **Threading:** Public `submit()` ist thread-safe; die gesamte Dekodierung
   läuft im Worker-Thread.
 
@@ -586,7 +613,7 @@ Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch.
 | `rec::StreamOpenInfo` / `DataInfo` / `StreamCloseInfo` | Dekodierte Payloads für Replay und Inspect |
 | `SendSpec` | Vorbereitete, bereits geframte Nachricht plus Zeitplan |
 | `ForwardConfig` | Ziel, Timeouts, Retries, Queue-Limit, Reconnect |
-| `JsonWriterConfig` | Schema, Typ-Map, Blob-Verzeichnis, Inline-Grenze, Formatierung |
+| `JsonWriterConfig` | Schema, Typ-Map, Blob-Verzeichnis, Chunk-Modus/-Verzeichnis, Inline-Grenze, Formatierung |
 | `ScanStats` | Ergebnis von `inspect`: Header, Zähler, Trailer, Schaden, gültiges Ende |
 | `CaptureRecord` | Ein dekodierter Datensatz für den Replay-Pfad |
 
@@ -612,6 +639,7 @@ classDiagram
     +start(err)
     +stop()
     +submit(item)
+    +set_item_observer(observer)
     +stats()
   }
   class BoundedItemQueue {
@@ -623,7 +651,7 @@ classDiagram
   class JsonWriter {
     +start(err)
     +stop()
-    +submit(item)
+    +submit(item, segment)
     +stats()
   }
   class FrameValidator {
@@ -667,12 +695,11 @@ classDiagram
 
   Server "1" --> "*" Session : verwaltet
   Server --> Recorder : schreibt
-  Server --> JsonWriter : optional
   Session --> FrameValidator
   Session --> SessionForwarder : passthrough
   Session --> BoundedItemQueue : submit
   BoundedItemQueue --> Recorder : konsumiert
-  BoundedItemQueue --> JsonWriter : konsumiert
+  Recorder --> JsonWriter : ItemObserver (Segment)
   JsonWriter --> FrameReader
   JsonWriter --> Schema
   ReplayRunner --> CaptureReader
@@ -693,9 +720,9 @@ classDiagram
 | FR-07 | `options.file_types`, `JsonWriter::emit_blob` |
 | FR-08 | `ReplayRunner`, `CaptureReader`, `ClientConnection` |
 | FR-09 | `SessionForwarder`, `Session::on_read/on_response` |
-| FR-10 | `Recorder::maybe_rotate` |
+| FR-10 | `Recorder::maybe_rotate`, `ItemObserver`, `JsonWriter::ensure_chunk` |
 | FR-11 | `CaptureReader`, `scan_capture_file`, `run_inspect` |
-| FR-12 | `JsonWriter`, `Schema` |
+| FR-12 | `JsonWriter`, `Schema`, `rec::segment_json_name` |
 | FR-13 | `SendSpec`, `Session::schedule_sends` |
 | FR-14 | `Dockerfile`, `compose.yaml` |
 | FR-15 | `Schema`, `ReplayRunner::validate_schema` |
@@ -711,13 +738,15 @@ flowchart TD
   A["main: Optionen parsen"] --> B{"Optionen gültig?"}
   B -->|nein| Z1["Hilfe + Exit 2"]
   B -->|ja| C["Session-Verzeichnis anlegen"]
-  C --> D["Schema laden (optional)"]
+  C --> C2["JSON-Zielverzeichnis anlegen (optional)"]
+  C2 --> D["Schema laden (optional)"]
   D --> E["Typ-Map auflösen"]
   E --> F["SendSpec vorbereiten (optional)"]
   F --> G["meta.json schreiben"]
-  G --> H["Recorder.start"]
-  H --> I["JsonWriter.start (optional)"]
-  I --> J["Server.open (bind/listen)"]
+  G --> H["Recorder.start (Chunk 1)"]
+  H --> I["JsonWriter.start (Chunk 1, optional)"]
+  I --> I2["ItemObserver registrieren"]
+  I2 --> J["Server.open (bind/listen)"]
   J --> K["Server.start"]
   K --> L["io_context.run"]
   L --> M{"Signal oder fataler Fehler?"}
@@ -737,9 +766,11 @@ Wichtige Reihenfolgen:
 
 1. `meta.json` wird geschrieben, **bevor** der Server lauscht.
 2. Der Recorder ist gestartet, bevor die erste Session Daten liefern kann.
-3. Beim Shutdown werden zuerst keine neuen Verbindungen mehr angenommen,
+3. Der JsonWriter öffnet Chunk 1 bereits beim Start; der Recorder kennt den
+   Observer, bevor die erste Session Items liefert.
+4. Beim Shutdown werden zuerst keine neuen Verbindungen mehr angenommen,
    dann Sessions geschlossen, dann Recorder und JSON-Writer beendet.
-4. `summary.json` und `json-summary.json` werden erst nach dem Leeren der
+5. `summary.json` und `json-summary.json` werden erst nach dem Leeren der
    Queues geschrieben.
 
 ### 6.2 Record-Pfad (Sequenz)
@@ -752,13 +783,19 @@ sequenceDiagram
   participant V as FrameValidator
   participant Q as Recorder-Queue
   participant R as Recorder-Thread
+  participant O as ItemObserver
   participant J as JsonWriter
 
   C->>S: TCP-Bytes
   S->>Q: Data-Item (Rohbytes, ts_ns)
   Q->>R: pop
-  R->>R: Payload + CRC32C + Batch
-  Note over S: Aufzeichnung ist bereits erfolgt
+  R->>R: append_record (Payload + CRC32C + Batch)
+  opt Rotation nötig
+    R->>R: close_segment + open_segment
+  end
+  R->>O: on_item(item, segment_index)
+  O->>J: submit(item, segment_index)
+  Note over R: Aufzeichnung ist bereits erfolgt
   opt Passthrough
     S->>S: Forwarder.forward(Kopie)
   end
@@ -770,15 +807,43 @@ sequenceDiagram
     V-->>S: Fehler
     S->>S: close(protocol_error)
   end
-  Q-->>J: gleiches Item (best effort)
-  J->>J: Frames reassemblieren/dekodieren
+  J->>J: ensure_chunk(segment), Frames reassemblieren/dekodieren
 ```
 
-Der Recorder und der JsonWriter konsumieren dasselbe Item. Der Recorder
-blockiert bei vollem Puffer gemäß `--overflow`; der JsonWriter blockiert nie
-und verwirft bei Überlauf.
+Der Recorder ist autoritativ für die Chunk-Zuordnung: Erst nach dem
+erfolgreichen Schreiben meldet er das Item über den `ItemObserver` an den
+JsonWriter, zusammen mit dem Segmentindex, in dem der Record gelandet ist.
+Der Recorder blockiert bei vollem Puffer gemäß `--overflow`; der JsonWriter
+blockiert nie und verwirft bei Überlauf.
 
-### 6.3 Verarbeitung eines Typed-Frames im JSON-Writer
+### 6.3 JSON-Chunk-Zuordnung
+
+```mermaid
+flowchart TD
+  A["Recorder: append_record erfolgreich"] --> B["segment_index = aktiver Capture-Chunk"]
+  B --> C["ItemObserver(item, segment_index)"]
+  C --> D["JsonWriter.submit(item, segment)"]
+  D --> E{"segment == aktueller JSON-Chunk?"}
+  E -->|ja| F["Events in offene Datei schreiben"]
+  E -->|nein| G["close_chunk, dann open_chunk(segment)"]
+  G --> G2{"Datei geöffnet?"}
+  G2 -->|ja| F
+  G2 -->|nein| G3["chunk_open_errors++, Events bis zum nächsten Chunk verwerfen"]
+  F --> H["Event mit \"segment\": N"]
+```
+
+- Der Recorder rotiert Capture-Chunks nach Zeit und/oder Größe. Der
+  Segmentindex wird erst nach `append_record()` ausgelesen, sodass ein Record
+  an der Grenze eindeutig dem vollendenden Chunk zugeordnet ist.
+- Der JsonWriter rotiert nicht selbst. Er wechselt die Datei genau dann, wenn
+  ein Item mit einem anderen Segment eintrifft.
+- `seq` zählt global über die Session weiter; `segment` ist pro Event
+  redundant zur Datei und erleichtert das Zusammenführen von Chunks.
+- Scheitert das Öffnen eines späteren Chunks, läuft die Binäraufnahme weiter;
+  `json-summary.json` meldet den Fehler über `chunk_open_errors`. Ein Fehler
+  beim Öffnen von Chunk 1 bricht den Start ab.
+
+### 6.4 Verarbeitung eines Typed-Frames im JSON-Writer
 
 ```mermaid
 sequenceDiagram
@@ -817,7 +882,7 @@ sequenceDiagram
   end
 ```
 
-### 6.4 Entscheidungsbaum: Typauflösung
+### 6.5 Entscheidungsbaum: Typauflösung
 
 ```mermaid
 flowchart TD
@@ -849,7 +914,7 @@ flowchart TD
   H -->|nein| J["Eintrag übernehmen"]
 ```
 
-### 6.5 Blob-Extraktion
+### 6.6 Blob-Extraktion
 
 ```mermaid
 flowchart TD
@@ -880,7 +945,7 @@ Hinweise:
 - Bekannte Binärformate werden nie zusätzlich base64-kodiert, damit das
   Sidecar kompakt bleibt.
 
-### 6.6 Passthrough
+### 6.7 Passthrough
 
 ```mermaid
 sequenceDiagram
@@ -907,7 +972,7 @@ Der Passthrough erzeugt pro Quell-Stream genau eine Zielverbindung. Die
 Richtung `in` ist Client → Server, `out` ist Zielserver → Client. Beide
 Richtungen landen in derselben Capture-Datei.
 
-### 6.7 Replay und Pacing
+### 6.8 Replay und Pacing
 
 ```mermaid
 sequenceDiagram
@@ -950,7 +1015,7 @@ Pacing-Regeln:
   entsteht.
 - Gesamt-High-Water: 64 MiB; pro Stream: 256 MiB.
 
-### 6.8 Entscheidungsbaum: Overflow-Politik
+### 6.9 Entscheidungsbaum: Overflow-Politik
 
 ```mermaid
 flowchart TD
@@ -972,7 +1037,7 @@ Stream als desynchronisiert; bis zum nächsten `stream_open` werden keine
 weiteren Frames dieses Streams dekodiert. Die Binäraufnahme bleibt vollständig,
 sofern der Recorder nicht ebenfalls verworfen hat.
 
-### 6.9 Entscheidungsbaum: Framing
+### 6.10 Entscheidungsbaum: Framing
 
 ```mermaid
 flowchart TD
@@ -990,7 +1055,7 @@ flowchart TD
   K -->|ja| M["Typ pro Frame auflösen"]
 ```
 
-### 6.10 Entscheidungsbaum: Beschädigte Aufnahme
+### 6.11 Entscheidungsbaum: Beschädigte Aufnahme
 
 ```mermaid
 flowchart TD
@@ -1101,6 +1166,8 @@ Regeln:
   ausgeführt.
 - Recorder- und JSON-Zustand werden nur von ihren jeweiligen Threads
   berührt.
+- Der Recorder ruft den `ItemObserver` nach dem Schreiben aus seinem
+  Writer-Thread auf; der Callback reicht das Item nur in die JSON-Queue.
 - `CaptureItem` ist nach dem Submit unveränderlich.
 - Statistiken sind atomar; Metriken werden ohne Sperren gelesen.
 
@@ -1139,6 +1206,7 @@ verliert bei `block` keine Bytes.
 | Protokollfehler im Stream | Stream schließen, Aufnahme fortsetzen | 0 |
 | Unbekannte Typ-ID | `unparsed`, Stream bleibt offen | 0 |
 | JSON-Queue voll | Items verwerfen, Stream desynchronisieren | 0 |
+| Öffnen eines JSON-Chunks fehlgeschlagen | Warnung, `chunk_open_errors` erhöhen, Aufnahme fortsetzen | 0 |
 | Forwarding-Fehler | Warnung, Source-Stream bleibt offen | 0 |
 | Fataler Schreibfehler | Shutdown, `summary.json` mit Fehler | 1 |
 | Replay: beschädigte Datei | Warnung + gültiges Präfix (oder Abbruch mit `--strict`) | 0/1 |
@@ -1205,8 +1273,9 @@ erlaubt.
 - Zentrale Ereignisse: Start/Ende, Session accepted/closed, Queue-Overflow,
   JSON-Drops, Blob-Schreibfehler, Replay-Statistik.
 - JSONL-Events: `stream_open`, `message`, `unparsed`, `@file`,
-  `stream_close`, `marker`.
-- Summary-Dateien: `summary.json`, `json-summary.json`, `meta.json`.
+  `stream_close`, `marker`; jedes Event enthält `seq` und `segment`.
+- Summary-Dateien: `summary.json`, `json-summary.json` (inkl.
+  `chunks_written`, `chunk_open_errors`, `chunks[]`), `meta.json`.
 
 ### 8.9 Sicherheit
 
@@ -1236,11 +1305,11 @@ erlaubt.
 
 | Test | Schwerpunkt |
 |------|-------------|
-| `unit` | Queue, CRC32C, Recorder/Reader, Options, Framing, JSON/Blob |
-| `integration` | Record mit Varint, JSONL, Chunking |
+| `unit` | Queue, CRC32C, Recorder/Reader, Options, Framing, Namenshelfer, JSON/Blob, Chunkrotation, Observer |
+| `integration` | Record mit Varint, JSONL-Chunks, `segment`-Feld, Einzeldatei-Modus, Chunking |
 | `replay` | Byte-genaues Replay, Pacing, Richtungen, Fehlerfälle |
-| `passthrough` | Beide Richtungen inkl. Aufzeichnung |
-| `typed` | 8-Byte-Header, Typ-Map, unbekannte IDs, Blobs |
+| `passthrough` | Beide Richtungen inkl. Aufzeichnung und JSON-Chunks |
+| `typed` | 8-Byte-Header, Typ-Map, unbekannte IDs, Blobs, JSON-Chunks |
 
 Zusätzlich: reale Referenzdaten in `tests/events.jsonl`, Benchmark über
 `bench/benchmark.py`, Sanitizer-Presets (`asan`, `tsan`).
@@ -1372,6 +1441,23 @@ Zusätzlich: reale Referenzdaten in `tests/events.jsonl`, Benchmark über
 - **Alternativen:** Späte Auflösung pro Frame (verworfen: Fehler erst zur
   Laufzeit).
 
+### ADR-13: JSON-Chunks folgen den Capture-Chunks
+
+- **Kontext:** Eine einzige große JSONL-Datei lässt sich nur über Zeitstempel
+  den Binär-Chunks zuordnen; bei Rotation entstehen sonst leicht
+  Auseinanderlaufen und aufwändige Auswertungen.
+- **Entscheidung:** Der Recorder bleibt autoritativ für Chunk-Grenzen und
+  meldet jedes geschriebene Item per `ItemObserver` mit seinem Segmentindex an
+  den JsonWriter. Dieser öffnet `capture-NNNNNN.jsonl` passend zu
+  `capture-NNNNNN.pcr` und schreibt `"segment": N` in jedes Event.
+  `--no-json-chunks` bzw. `--json-file` erhalten den Einzeldatei-Modus.
+- **Folgen:** Direkte 1:1-Zuordnung ohne Zeitstempel-Heuristik; Shutdown-
+  Reihenfolge und Statistik müssen die Chunkliste mitführen. JSON bleibt
+  Best-effort, die Binäraufnahme unverändert Wahrheit.
+- **Alternativen:** Unabhängige JSON-Rotation (verworfen: driftet und
+  widerspricht der Recorder-Autorität), nur Einzeldatei (verworfen:
+  schlechtere Zuordnung bei langen Sessions).
+
 ---
 
 ## 10. Qualitätsanforderungen
@@ -1422,6 +1508,7 @@ flowchart TD
 | QS-08 | Reale Blob-Aufnahme mit 103 Frames | 59 pcap, 32 wav, 12 text, byte-genau | `tests/events.jsonl` |
 | QS-09 | Containerstart ohne Host-Protobuf | App läuft | `docker compose up` |
 | QS-10 | 1 GiB Daten, 1 MiB Batch | Stabiler Durchsatz, begrenzter Speicher | Benchmark |
+| QS-11 | Session rotiert in mehrere Capture-Chunks | Gleichnamige JSONL-Chunks, jedes Event mit korrektem `segment` | `integration`-/`typed`-Test, Unit-Chunkrotation |
 
 ### 10.3 Messbare Zielgrößen
 
@@ -1451,6 +1538,7 @@ flowchart TD
 | R-10 | Blob-Extraktion nur mit `--json` | Ohne JSON keine Dateien | Warnung beim Start; dokumentiert |
 | R-11 | `tests/__pycache__` versioniert | Rauschen im Diff | Bei Bedarf entfernen und `.gitignore` konsequent nutzen |
 | R-12 | Docker läuft als root | Dateien gehören root | `PRP_UID`/`PRP_GID`-Hinweis in `docker.md` |
+| R-13 | JSON-Chunk kann nicht geöffnet werden | JSONL-Lücke für dieses Segment | `chunk_open_errors` in `json-summary.json`; Binäraufnahme läuft weiter |
 
 ---
 
@@ -1462,7 +1550,7 @@ flowchart TD
 | **Backpressure** | Rückstau, der Producer bremst, statt Speicher unbegrenzt zu füllen |
 | **Blob** | Vollständige Datei in einem Typed-Frame, z. B. pcap oder WAV |
 | **Capture** | Binäraufnahme im PCRP-Format (`.pcr`) |
-| **Chunk/Segment** | Einzelne Capture-Datei bei Rotation |
+| **Chunk/Segment** | Einzelne Capture-Datei bei Rotation; JSON-Chunks spiegeln sie als `capture-NNNNNN.jsonl` |
 | **CRC32C** | Prüfsummenverfahren für Datensatzintegrität |
 | **Desync** | Zustand, in dem das JSON-Sidecar keine gültigen Frames mehr reassemblieren kann |
 | **Framing** | Art der Nachrichtengrenzen auf dem Wire |

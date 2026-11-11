@@ -442,18 +442,27 @@ def test_response_json(binary: str, proto: str, workdir: str) -> None:
         finish_passthrough(proc, stderr_file, stderr_path)
         sink.close()
 
-    events_path = os.path.join(out_dir, "events.jsonl")
-    check(os.path.exists(events_path), f"missing JSONL output in {out_dir}")
+    jsonl_paths = sorted(
+        os.path.join(out_dir, name)
+        for name in os.listdir(out_dir)
+        if name.startswith("capture-") and name.endswith(".jsonl")
+    )
+    if not jsonl_paths:
+        single = os.path.join(out_dir, "events.jsonl")
+        if os.path.exists(single):
+            jsonl_paths = [single]
+    check(bool(jsonl_paths), f"missing JSONL output in {out_dir}")
     out_events = []
-    with open(events_path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            event = json.loads(line)
-            if event.get("dir") == "out" and "message" in event:
-                out_events.append(event)
-    check(bool(out_events), f"no outbound JSON event in {events_path}")
+    for path in jsonl_paths:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                event = json.loads(line)
+                if event.get("dir") == "out" and "message" in event:
+                    out_events.append(event)
+    check(bool(out_events), f"no outbound JSON event in {jsonl_paths}")
     check(any(event["type"] == "demo.TestRecord" and event["message"].get("name") == "resp"
               for event in out_events),
           f"unexpected outbound JSON events: {out_events}")

@@ -53,7 +53,7 @@ bool parse_bool_value(std::string_view text, bool& out) {
 }
 
 bool is_boolean_key(const std::string& key) {
-  return key == "flat" || key == "durable" || key == "json" ||
+  return key == "flat" || key == "durable" || key == "json" || key == "json-chunks" ||
          key == "json-print-defaults" || key == "json-preserve-names" || key == "truncate" ||
          key == "reconnect" || key == "strict" || key == "quiet" || key == "verbose";
 }
@@ -124,6 +124,8 @@ bool load_ini_config(const fs::path& path, std::vector<std::string>& args, std::
       }
       if (key == "json") {
         args.push_back(enabled ? "--json=jsonl" : "--no-json");
+      } else if (key == "json-chunks") {
+        args.push_back(enabled ? "--json-chunks" : "--no-json-chunks");
       } else if (enabled) {
         args.push_back("--" + key);
       } else if (key == "flat") {
@@ -521,7 +523,18 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       std::string text;
       if (!need_value(text)) return false;
       out.json_file = text;
+      out.json_file_set = true;
       out.json_enabled = true;
+    } else if (key == "--json-chunks") {
+      out.json_chunked = true;
+      out.json_chunks_set = true;
+    } else if (key == "--no-json-chunks") {
+      out.json_chunked = false;
+      out.json_chunks_set = true;
+    } else if (key == "--json-dir") {
+      std::string text;
+      if (!need_value(text)) return false;
+      out.json_dir = text;
     } else if (key == "--no-json") {
       out.json_enabled = false;
     } else if (key == "--json-print-defaults") {
@@ -654,6 +667,15 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
 
   if (out.help) return true;
 
+  // JSON output is chunked (one capture-NNNNNN.jsonl per capture chunk) unless
+  // an explicit --json-file selects a single session-wide file. Combining an
+  // explicit --json-file with --json-chunks is contradictory.
+  if (out.json_file_set && !out.json_chunks_set) out.json_chunked = false;
+  if (out.json_file_set && out.json_chunks_set && out.json_chunked) {
+    err = "--json-file and --json-chunks are mutually exclusive";
+    return false;
+  }
+
   if (out.command == "record" || out.command == "passthrough") {
     if (out.out_dir.empty()) {
       err = out.command + " requires --out <directory>";
@@ -662,6 +684,16 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
     if (out.json_enabled && out.proto_file.empty()) {
       err = "--json requires --proto <file.proto>";
       return false;
+    }
+    if (!out.json_dir.empty()) {
+      if (!out.json_enabled) {
+        err = "--json-dir requires --json";
+        return false;
+      }
+      if (!out.json_chunked) {
+        err = "--json-dir requires JSON chunk mode (do not combine it with --json-file)";
+        return false;
+      }
     }
     if (out.framing == rec::Framing::TypedLengthLE && !out.message_type.empty()) {
       err = "--message-type is not allowed with typed framing (the type comes from each frame header)";
@@ -848,7 +880,10 @@ void print_help() {
       "                              type \"@file\" in the JSONL sidecar)\n"
       "  --framing <mode>            raw|varint-length|typed-length-le (default varint-length)\n"
       "  --json[=jsonl|off]          Enable JSONL sidecar (requires --proto)\n"
-      "  --json-file <path>          JSONL data file (default <session>/events.jsonl)\n"
+      "  --json-chunks               One capture-NNNNNN.jsonl per capture chunk (default)\n"
+      "  --no-json-chunks            Write a single session-wide JSONL file instead\n"
+      "  --json-file <path>          Single JSONL file (implies --no-json-chunks)\n"
+      "  --json-dir <dir>            Directory for chunked JSONL (default session dir)\n"
       "  --json-print-defaults       Include fields with default values\n"
       "  --json-preserve-names       Keep proto field names (snake_case)\n"
       "  --max-frame <size>          Max framed message size (default 16MiB)\n"

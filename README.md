@@ -22,6 +22,7 @@ beschreibt Architektur, Laufzeitverhalten und Entscheidungen; das
 - **Datei-/Blob-Kanäle:** Typ-IDs mit `@file`/`@blob` werden als Dateien extrahiert
 - **Verlustfreie Binäraufnahme:** inklusive Framing-Header, exakt replayfähig
 - **Optionales JSONL:** dekodierte Nachrichten, Typ-IDs, Fehlerdiagnose, Blob-Metadaten
+- **JSON-Chunks:** standardmäßig eine JSONL-Datei pro Capture-Chunk für direkte Zuordnung
 - **Chunking:** Aufteilung der Binäraufnahme nach Zeit und/oder Größe
 - **Passthrough:** live weiterleiten und gleichzeitig aufzeichnen
 - **Robuste Aufnahme:** CRC32C, Trailer, Wiederherstellung abgeschnittener Dateien
@@ -178,6 +179,39 @@ unbekannte Blobs als `bytes_b64`. Bekannte Binärformate werden nie zusätzlich
 base64-kodiert. Für die Extraktion muss `--json` aktiv sein; ohne JSON wird nur
 eine Warnung ausgegeben.
 
+### JSONL-Chunking
+
+Ist `--json` aktiv, schreibt der JSON-Writer standardmäßig **eine JSONL-Datei
+pro Capture-Chunk**. Beide Dateien teilen sich denselben Stamm:
+
+```text
+capture-000001.pcr   ↔   capture-000001.jsonl
+capture-000002.pcr   ↔   capture-000002.jsonl
+```
+
+Damit lassen sich Events ohne Zeitstempel-Suche dem passenden Binär-Chunk
+zuordnen. Der Recorder bestimmt die Chunk-Grenzen; der JSON-Writer übernimmt
+den Segmentindex jedes Items, statt unabhängig zu rotieren. Zusätzlich enthält
+jedes Event das Feld `"segment": N`.
+
+- Chunk 1 wird beim Start angelegt, sodass auch eine leere Session eine
+  JSONL-Datei besitzt.
+- `seq` läuft global über die gesamte Session weiter, nicht pro Chunk.
+- Ein Frame, der über eine Chunk-Grenze reicht, wird dem Item und damit dem
+  Segment zugeordnet, das ihn vervollständigt.
+- `--json-dir <dir>` legt die JSONL-Dateien in ein eigenes Verzeichnis
+  (Default: Session-Verzeichnis).
+
+Einzeldatei-Modus wie in früheren Versionen:
+
+```bash
+protorecprep record ... --json --no-json-chunks
+protorecprep record ... --json --json-file events.jsonl   # impliziert Einzeldatei
+```
+
+`--json-file` und `--json-chunks` schließen sich gegenseitig aus. Die
+Chunk-Statistik steht in `json-summary.json` unter `chunks`.
+
 ## Voraussetzungen
 
 ### Bauen auf macOS
@@ -278,7 +312,10 @@ angenommen. Werte ohne Suffix bei Größen sind Bytes.
 | `--type-map <id>=<type>` | – | Typ-ID → Nachricht oder `@file`; wiederholbar |
 | `--framing <mode>` | `varint-length` | `raw`, `varint-length`, `typed-length-le` |
 | `--json[=jsonl\|off]` | `off` | JSONL-Sidecar aktivieren/deaktivieren; `--no-json` schaltet ihn ab (benötigt `--proto`) |
-| `--json-file <path>` | `<session>/events.jsonl` | Pfad der JSONL-Datei; relative Pfade liegen in der Session |
+| `--json-chunks` | `true` | Eine `capture-NNNNNN.jsonl` pro Capture-Chunk (Default bei `--json`) |
+| `--no-json-chunks` | – | Eine einzige sessionweite JSONL-Datei schreiben |
+| `--json-file <path>` | – | Einzelne JSONL-Datei; impliziert `--no-json-chunks`; relative Pfade liegen in der Session |
+| `--json-dir <dir>` | Session-Verzeichnis | Ablageort der JSONL-Chunks (nur im Chunk-Modus) |
 | `--json-print-defaults` | `false` | Felder mit Default-Werten ausgeben |
 | `--json-preserve-names` | `false` | Protobuf-Feldnamen (`snake_case`) statt lowerCamelCase |
 | `--max-frame <size>` | `16MiB` | Maximale Größe eines Frames (1 Byte bis 1 GiB) |
@@ -389,7 +426,11 @@ type_map = 1=TestRecord
 
 [json]
 json = true
-json_file = events.jsonl
+# Chunked JSONL (default): one capture-NNNNNN.jsonl per capture chunk.
+# json_chunks = true
+# json_dir = json
+# Single-file mode:
+# json_file = events.jsonl
 
 [chunks]
 chunk_interval = 1m
@@ -417,8 +458,9 @@ Ohne `--flat` legt jede Aufnahme ein eigenes Session-Verzeichnis an:
 recordings/
 └── session-20260101-120000-abcd1234/
     ├── capture-000001.pcr      # Binäraufnahme (Chunk 1)
+    ├── capture-000001.jsonl    # JSONL-Events zu Chunk 1
     ├── capture-000002.pcr      # weitere Chunks bei Rotation
-    ├── events.jsonl            # optionales JSONL-Sidecar
+    ├── capture-000002.jsonl
     ├── files/                  # extrahierte Blobs (@file)
     │   ├── 48-pcap.pcap
     │   └── 49-text.txt
@@ -426,6 +468,9 @@ recordings/
     ├── summary.json            # Statistik der Binäraufnahme
     └── json-summary.json       # Statistik des JSON-Writers
 ```
+
+Im Einzeldatei-Modus (`--json-file` oder `--no-json-chunks`) heißt die
+JSONL-Datei standardmäßig `events.jsonl`.
 
 Mit `--flat` liegen alle Dateien direkt in `--out`.
 
@@ -435,7 +480,8 @@ Enthält unter anderem Tool-Version, Modus, Session-ID, Startzeit, Host,
 Listen-Adresse, Ausgabeverzeichnis, Framing, Proto-Pfad und -SHA-256,
 `message_type`, `proto_package`, `type_map` (inkl. `"@file"`-Einträgen),
 `blob_dir`, JSON-Einstellungen, Chunk-/IO-Parameter, `send`- und
-`forward`-Konfiguration.
+`forward`-Konfiguration. Im Chunk-Modus stehen `json_chunks`, `json_dir` und
+`json_chunk_pattern` (`capture-%06u.jsonl`) statt `json_file`.
 
 ### `summary.json`
 
@@ -448,12 +494,15 @@ eine Fehlermeldung.
 Statistik des JSON-Sidecars: `events`, `messages`, `blobs`, `blob_bytes`,
 `unparsed`, `parse_errors`, `dropped_items`, `dropped_bytes`,
 `desynced_streams`, `skipped_data_items`, `bytes_written`, `failed`, `error`.
+Im Chunk-Modus zusätzlich `chunks_written`, `chunk_open_errors` und `chunks`
+(je Eintrag `segment`, `file`, `events`, `bytes`).
 
 ### JSONL-Events
 
 Jede Zeile ist ein eigenständiges JSON-Objekt. `ts_ns` ist ein
-Unix-Zeitstempel in Nanosekunden, `stream` die Verbindungs-ID und `dir` die
-Richtung (`in` = Client → Server, `out` = Server → Client).
+Unix-Zeitstempel in Nanosekunden, `stream` die Verbindungs-ID, `segment` der
+Capture-Chunk und `dir` die Richtung (`in` = Client → Server,
+`out` = Server → Client).
 
 | Event | Bedeutung |
 |-------|-----------|
@@ -467,11 +516,11 @@ Richtung (`in` = Client → Server, `out` = Server → Client).
 Beispiele:
 
 ```json
-{"seq":1,"ts_ns":1760000000000000000,"event":"stream_open","stream":1,"peer":"192.0.2.10:40842","type":""}
-{"seq":2,"ts_ns":1760000000000000000,"stream":1,"dir":"in","type":"demo.TestRecord","type_id":1,"message":{"seq":"1","name":"hello"}}
-{"seq":3,"ts_ns":1760000000000000000,"stream":1,"dir":"in","unparsed":true,"reason":"unknown message type id 7","type_id":7}
-{"seq":4,"ts_ns":1760000000000000000,"stream":1,"dir":"in","type":"@file","type_id":3,"blob":{"kind":"pcap","size":388,"sha256":"…","path":"…/files/4-pcap.pcap","prefix":1}}
-{"seq":5,"ts_ns":1760000000000000000,"stream":1,"event":"stream_close","reason":"peer_closed"}
+{"seq":1,"segment":1,"ts_ns":1760000000000000000,"event":"stream_open","stream":1,"peer":"192.0.2.10:40842","type":""}
+{"seq":2,"segment":1,"ts_ns":1760000000000000000,"stream":1,"dir":"in","type":"demo.TestRecord","type_id":1,"message":{"seq":"1","name":"hello"}}
+{"seq":3,"segment":1,"ts_ns":1760000000000000000,"stream":1,"dir":"in","unparsed":true,"reason":"unknown message type id 7","type_id":7}
+{"seq":4,"segment":1,"ts_ns":1760000000000000000,"stream":1,"dir":"in","type":"@file","type_id":3,"blob":{"kind":"pcap","size":388,"sha256":"…","path":"…/files/4-pcap.pcap","prefix":1}}
+{"seq":5,"segment":1,"ts_ns":1760000000000000000,"stream":1,"event":"stream_close","reason":"peer_closed"}
 ```
 
 Mögliche `reason`-Werte bei `stream_close`: `peer_closed`, `local_shutdown`,

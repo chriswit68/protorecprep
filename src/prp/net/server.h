@@ -12,7 +12,6 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
-#include "prp/json/json_writer.h"
 #include "prp/net/forwarder.h"
 #include "prp/record/format.h"
 #include "prp/record/recorder.h"
@@ -56,7 +55,7 @@ class Session;
 
 class Server {
  public:
-  Server(boost::asio::io_context& io, ServerConfig config, Recorder& recorder, JsonWriter* json);
+  Server(boost::asio::io_context& io, ServerConfig config, Recorder& recorder);
   ~Server();
 
   Server(const Server&) = delete;
@@ -76,7 +75,6 @@ class Server {
 
   const ServerConfig& config() const { return config_; }
   Recorder& recorder() { return recorder_; }
-  JsonWriter* json() { return json_; }
 
   // Aggregated forwarding statistics (passthrough mode).
   void note_forward_result(bool started, uint64_t bytes, uint64_t connects, bool failed,
@@ -92,7 +90,6 @@ class Server {
   boost::asio::io_context& io_;
   ServerConfig config_;
   Recorder& recorder_;
-  JsonWriter* json_;
   boost::asio::ip::tcp::acceptor acceptor_;
   std::atomic<bool> stopping_{false};
   std::atomic<bool> stopped_fired_{false};

@@ -17,11 +17,8 @@
 namespace prp {
 namespace {
 
-std::string segment_name(uint32_t index) {
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "capture-%06u.pcr", index);
-  return buf;
-}
+// Reuse the shared helper so capture chunks and JSON chunks always share a stem.
+std::string segment_name(uint32_t index) { return rec::segment_capture_name(index); }
 
 }  // namespace
 
@@ -70,6 +67,11 @@ PushResult Recorder::submit(const ItemPtr& item) {
 void Recorder::set_fatal_callback(std::function<void(std::string)> callback) {
   std::lock_guard<std::mutex> lock(callback_mutex_);
   fatal_callback_ = std::move(callback);
+}
+
+void Recorder::set_item_observer(ItemObserver observer) {
+  std::lock_guard<std::mutex> lock(observer_mutex_);
+  observer_ = std::move(observer);
 }
 
 RecorderStats Recorder::stats() const {
@@ -308,6 +310,11 @@ void Recorder::fail(std::string error) {
 void Recorder::run() {
   std::string err;
   uint64_t since_sync_check = 0;
+  ItemObserver observer;
+  {
+    std::lock_guard<std::mutex> lock(observer_mutex_);
+    observer = observer_;
+  }
 
   while (true) {
     ItemPtr item = queue_.pop();
@@ -339,6 +346,10 @@ void Recorder::run() {
       fail(err);
       continue;
     }
+    // append_record may have rotated segments; segment_index_ now identifies the
+    // chunk that actually contains this record. Mirror exactly that index to the
+    // JSON sidecar so both chunk series stay aligned.
+    if (observer) observer(item, segment_index_);
 
     if (batch_.size() >= config_.write_batch_bytes) {
       if (!flush_batch(err)) {
