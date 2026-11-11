@@ -33,6 +33,12 @@ bool ensure_directory(const fs::path& dir, std::string& err) {
   return true;
 }
 
+fs::path resolve_subdir(const fs::path& base, const fs::path& sub) {
+  if (sub.empty()) return base;
+  if (sub.is_absolute()) return sub;
+  return base / sub;
+}
+
 static bool fsync_path(const fs::path& path, std::string& err) {
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) {

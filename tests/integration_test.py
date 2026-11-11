@@ -313,6 +313,78 @@ def test_chunking_and_json_file(binary: str, proto: str, workdir: str) -> None:
         stderr_file.close()
 
 
+def test_relative_out_json_chunks(binary: str, proto: str, workdir: str) -> None:
+    """Relative --out keeps JSON chunks next to the captures in the session dir."""
+    port = pick_port()
+    stderr_path = os.path.join(workdir, "relative-out.log")
+    stderr_file = open(stderr_path, "wb")  # noqa: SIM115
+    proc = subprocess.Popen(
+        [
+            binary,
+            "record",
+            "--listen", f"127.0.0.1:{port}",
+            "--out", "recordings",
+            "--proto", proto,
+            "--message-type", "demo.TestRecord",
+            "--json",
+            "--fsync-interval", "0",
+            "--write-batch", "4KiB",
+            "--log-level", "info",
+        ],
+        cwd=workdir,
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_file,
+    )
+    try:
+        sock = wait_for_server(port, time.time() + 10.0)
+        sock.sendall(frame(enc_record(1, "relative-out")))
+        sock.close()
+        time.sleep(0.3)
+        proc.send_signal(signal.SIGINT)
+        rc = proc.wait(timeout=20)
+        check(rc == 0, f"relative-out recorder exited with {rc}\n{open(stderr_path).read()}")
+
+        out_dir = os.path.join(workdir, "recordings")
+        sessions = [d for d in os.listdir(out_dir) if d.startswith("session-")]
+        check(len(sessions) == 1, f"expected one session dir, got {sessions}")
+        session_dir = os.path.join(out_dir, sessions[0])
+
+        captures = sorted(
+            f for f in os.listdir(session_dir) if f.startswith("capture-") and f.endswith(".pcr")
+        )
+        json_chunks = sorted(
+            f for f in os.listdir(session_dir) if f.startswith("capture-") and f.endswith(".jsonl")
+        )
+        check(bool(captures), "missing capture chunks")
+        check(bool(json_chunks), "missing JSON chunks next to the captures")
+        check(
+            json_chunks == [f[:-4] + ".jsonl" for f in captures],
+            f"JSON chunks do not mirror capture chunks: {json_chunks} vs {captures}",
+        )
+
+        # Regression: a relative --out must not be joined below the session again.
+        nested = os.path.join(session_dir, "recordings")
+        check(not os.path.exists(nested), f"unexpected nested session directory: {nested}")
+        for entry in os.listdir(session_dir):
+            path = os.path.join(session_dir, entry)
+            if os.path.isdir(path):
+                leaked = [f for f in os.listdir(path) if f.endswith(".jsonl")]
+                check(not leaked, f"JSON chunks nested in {path}: {leaked}")
+
+        with open(os.path.join(session_dir, "meta.json")) as fh:
+            meta = json.load(fh)
+        check(meta["json_chunks"] is True, meta)
+        check(
+            os.path.normpath(meta["json_dir"]) == os.path.normpath(os.path.join("recordings", sessions[0])),
+            meta,
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        stderr_file.close()
+
+
 def test_config_file_recording(binary: str, proto: str, workdir: str) -> None:
     """Starts a recording entirely from an INI config file."""
     port = pick_port()
@@ -634,6 +706,7 @@ def main() -> int:
         test_raw_json(binary, proto, workdir, pick_port())
         test_outbound(binary, proto, workdir, pick_port())
         test_chunking_and_json_file(binary, proto, workdir)
+        test_relative_out_json_chunks(binary, proto, workdir)
         test_config_file_recording(binary, proto, workdir)
 
         print(f"integration test passed ({events} events, {len(captures)} segments, outbound verified)")

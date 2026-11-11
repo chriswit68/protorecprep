@@ -387,6 +387,25 @@ void test_chunk_and_json_options() {
   CHECK_EQ(prp::rec::segment_json_name(42), std::string("capture-000042.jsonl"));
 }
 
+void test_output_paths() {
+  const prp::fs::path session("recordings/session-20260101-120000-abcd1234");
+
+  // The default (no --json-dir) is the session directory itself, which is
+  // where the capture chunks live.
+  CHECK_EQ(prp::resolve_subdir(session, {}).string(), session.string());
+
+  // An explicit relative subdirectory is resolved below the session directory.
+  CHECK_EQ(prp::resolve_subdir(session, "json").string(), (session / "json").string());
+
+  // Absolute paths are taken as-is.
+  CHECK_EQ(prp::resolve_subdir(session, "/tmp/json").string(), std::string("/tmp/json"));
+
+  // Regression: with a relative --out the session path must not be appended to
+  // itself a second time.
+  const std::string resolved = prp::resolve_subdir(session, {}).string();
+  CHECK_EQ(resolved.find(session.string(), 1), std::string::npos);
+}
+
 void test_replay_options() {
   auto parse = [](std::vector<std::string> args, prp::Options& out, std::string& err) {
     std::vector<char*> argv;
@@ -1374,6 +1393,7 @@ int main(int argc, char** argv) {
   test_parsers();
   test_type_map_options();
   test_chunk_and_json_options();
+  test_output_paths();
   test_replay_options();
   test_passthrough_options();
   test_config_file();

@@ -13,6 +13,11 @@ namespace fs = std::filesystem;
 // failure (never throws).
 bool ensure_directory(const fs::path& dir, std::string& err);
 
+// Resolves an optional subdirectory below `base`. An empty `sub` selects
+// `base` itself, a relative `sub` is appended to `base`, and an absolute `sub`
+// is returned unchanged.
+fs::path resolve_subdir(const fs::path& base, const fs::path& sub);
+
 // Writes `content` to `path` atomically (temp file + rename), fsyncing the
 // file and the containing directory.
 bool write_file_atomic(const fs::path& path, std::string_view content, std::string& err);

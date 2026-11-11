@@ -179,7 +179,9 @@ docker compose run --rm --service-ports protorecprep \
 
 `--json-file <pfad>` impliziert ebenfalls den Einzeldatei-Modus und ist mit
 `--json-chunks` nicht kombinierbar. `--json-dir <dir>` legt die Chunk-Dateien
-in ein separates Verzeichnis innerhalb der Session. Die Chunkliste und
+in ein separates Verzeichnis innerhalb der Session (relative Pfade werden ab
+dem Session-Verzeichnis aufgelöst); ohne Angabe liegen sie direkt neben den
+Capture-Dateien. Die Chunkliste und
 Fehlerzähler stehen in `json-summary.json` (`chunks_written`,
 `chunk_open_errors`, `chunks[]`).
 

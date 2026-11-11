@@ -341,14 +341,16 @@ int run_server_mode(const Options& options, std::string& err) {
   const bool json_chunked = options.json_enabled && options.json_chunked;
   if (options.json_enabled) {
     if (json_chunked) {
-      json_dir = options.json_dir.empty() ? session_dir : options.json_dir;
-      if (json_dir.is_relative()) json_dir = session_dir / json_dir;
+      // Default: JSON chunks live next to the capture chunks in the session
+      // directory. Only an explicit --json-dir is resolved relative to it, so
+      // a relative --out is never joined to itself a second time.
+      json_dir = resolve_subdir(session_dir, options.json_dir);
       if (!ensure_directory(json_dir, err)) {
         return fail("cannot create JSON chunk directory: " + err);
       }
     } else {
-      json_path = options.json_file.empty() ? fs::path("events.jsonl") : options.json_file;
-      if (json_path.is_relative()) json_path = session_dir / json_path;
+      json_path = resolve_subdir(
+          session_dir, options.json_file.empty() ? fs::path("events.jsonl") : options.json_file);
       if (!json_path.parent_path().empty() && !ensure_directory(json_path.parent_path(), err)) {
         return fail("cannot create JSON output directory: " + err);
       }

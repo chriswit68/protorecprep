@@ -199,8 +199,9 @@ jedes Event das Feld `"segment": N`.
 - `seq` läuft global über die gesamte Session weiter, nicht pro Chunk.
 - Ein Frame, der über eine Chunk-Grenze reicht, wird dem Item und damit dem
   Segment zugeordnet, das ihn vervollständigt.
-- `--json-dir <dir>` legt die JSONL-Dateien in ein eigenes Verzeichnis
-  (Default: Session-Verzeichnis).
+- `--json-dir <dir>` legt die JSONL-Dateien in ein eigenes Verzeichnis.
+  Ohne Angabe liegen sie direkt neben den `capture-NNNNNN.pcr`-Dateien im
+  Session-Verzeichnis; relative Pfade werden relativ dazu aufgelöst.
 
 Einzeldatei-Modus wie in früheren Versionen:
 
@@ -315,7 +316,7 @@ angenommen. Werte ohne Suffix bei Größen sind Bytes.
 | `--json-chunks` | `true` | Eine `capture-NNNNNN.jsonl` pro Capture-Chunk (Default bei `--json`) |
 | `--no-json-chunks` | – | Eine einzige sessionweite JSONL-Datei schreiben |
 | `--json-file <path>` | – | Einzelne JSONL-Datei; impliziert `--no-json-chunks`; relative Pfade liegen in der Session |
-| `--json-dir <dir>` | Session-Verzeichnis | Ablageort der JSONL-Chunks (nur im Chunk-Modus) |
+| `--json-dir <dir>` | Session-Verzeichnis (neben den Captures) | Ablageort der JSONL-Chunks (nur im Chunk-Modus, relative Pfade ab Session-Verzeichnis) |
 | `--json-print-defaults` | `false` | Felder mit Default-Werten ausgeben |
 | `--json-preserve-names` | `false` | Protobuf-Feldnamen (`snake_case`) statt lowerCamelCase |
 | `--max-frame <size>` | `16MiB` | Maximale Größe eines Frames (1 Byte bis 1 GiB) |

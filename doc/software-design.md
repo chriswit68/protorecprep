@@ -382,7 +382,9 @@ Session; ein Frame über einer Chunk-Grenze gehört zu dem Segment, das ihn
 vervollständigt. Chunk 1 wird bereits in `JsonWriter::start()` geöffnet, damit
 auch eine leere Session eine JSONL-Datei besitzt. `--no-json-chunks` bzw. ein
 explizites `--json-file` schalten auf eine einzige sessionweite Datei um;
-`--json-dir` legt die Chunk-Dateien in ein separates Verzeichnis.
+`--json-dir` legt die Chunk-Dateien in ein separates Verzeichnis. Ohne Angabe
+liegen sie direkt neben den Capture-Chunks; ein relativer Pfad wird relativ
+zum Session-Verzeichnis aufgelöst.
 
 #### 5.2.5 Schema
 
