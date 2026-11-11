@@ -668,5 +668,4 @@ Der Container läuft standardmäßig als `root`. Für Host-UID-Betrieb siehe
 
 ## Lizenz
 
-Im Repository ist derzeit keine explizite Lizenzdatei vorhanden. Nutzung und
-Weitergabe sind daher mit dem Autor abzustimmen.
+Dieses Projekt steht unter der MIT-Lizenz. Siehe [LICENSE](LICENSE).
