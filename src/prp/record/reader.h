@@ -84,6 +84,10 @@ class CaptureReader {
   const rec::FileHeader& header() const { return header_; }
   const fs::path& path() const { return path_; }
   uint64_t records_read() const { return records_read_; }
+  // Bytes of the underlying file already consumed: the file header plus every
+  // fully validated record. Suitable for a byte-based progress display.
+  uint64_t bytes_consumed() const { return bytes_consumed_; }
+  uint64_t file_size() const { return file_size_; }
 
  private:
   FILE* file_ = nullptr;
@@ -92,6 +96,8 @@ class CaptureReader {
   std::vector<uint8_t> payload_;
   bool damaged_ = false;
   uint64_t records_read_ = 0;
+  uint64_t bytes_consumed_ = 0;
+  uint64_t file_size_ = 0;
 };
 
 }  // namespace prp

@@ -11,6 +11,7 @@ namespace {
 
 std::atomic<LogLevel> g_level{LogLevel::Info};
 std::mutex g_mutex;
+bool g_progress_active = false;
 
 const char* level_name(LogLevel level) {
   switch (level) {
@@ -44,6 +45,10 @@ void log_message(LogLevel level, std::string_view msg) {
   std::strftime(stamp, sizeof(stamp), "%H:%M:%S", &tm);
 
   std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_progress_active) {
+    std::fputc('\n', stderr);
+    g_progress_active = false;
+  }
   std::fprintf(stderr, "[%s.%03lld] %s %.*s\n", stamp, static_cast<long long>(ms), level_name(level),
                static_cast<int>(msg.size()), msg.data());
   std::fflush(stderr);
@@ -71,6 +76,25 @@ void log_printf(LogLevel level, const char* fmt, ...) {
   std::vsnprintf(heap.data(), heap.size() + 1, fmt, copy);
   va_end(copy);
   log_message(level, heap);
+}
+
+void clear_progress_line() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_progress_active) return;
+  std::fputc('\n', stderr);
+  std::fflush(stderr);
+  g_progress_active = false;
+}
+
+void set_progress_line(std::string_view text) {
+  if (text.empty()) {
+    clear_progress_line();
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_mutex);
+  std::fprintf(stderr, "\r%.*s", static_cast<int>(text.size()), text.data());
+  std::fflush(stderr);
+  g_progress_active = true;
 }
 
 }  // namespace prp

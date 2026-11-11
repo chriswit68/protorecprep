@@ -948,6 +948,8 @@ void test_capture_reader() {
   {
     prp::CaptureReader reader;
     CHECK(reader.open(file, err));
+    CHECK_EQ(reader.file_size(), static_cast<uint64_t>(std::filesystem::file_size(file)));
+    CHECK_EQ(reader.bytes_consumed(), static_cast<uint64_t>(header_size));
     std::vector<std::string> data;
     std::vector<prp::Direction> directions;
     uint32_t opened = 0;
@@ -983,6 +985,8 @@ void test_capture_reader() {
           break;
       }
     }
+    CHECK_EQ(reader.bytes_consumed(), reader.file_size());
+    CHECK_EQ(reader.bytes_consumed(), static_cast<uint64_t>(std::filesystem::file_size(file)));
     CHECK_EQ(opened, uint32_t{1});
     CHECK_EQ(closed, uint32_t{1});
     CHECK_EQ(trailers, uint32_t{1});

@@ -230,17 +230,22 @@ bool CaptureReader::open(const fs::path& path, std::string& err) {
   path_ = path;
   damaged_ = false;
   records_read_ = 0;
+  bytes_consumed_ = 0;
+  file_size_ = 0;
   file_ = std::fopen(path.c_str(), "rb");
   if (!file_) {
     err = "cannot open " + path.string() + ": " + std::strerror(errno);
     return false;
   }
+  struct stat st{};
+  if (::fstat(::fileno(file_), &st) == 0) file_size_ = static_cast<uint64_t>(st.st_size);
   size_t header_size = 0;
   if (!read_file_header(file_, header_, header_size, err)) {
     close();
     err = path.string() + ": " + err;
     return false;
   }
+  bytes_consumed_ = header_size;
   return true;
 }
 
@@ -255,7 +260,11 @@ ReadStatus CaptureReader::next(CaptureRecord& out, std::string& detail) {
     damaged_ = true;
     return ReadStatus::Error;
   }
-  if (got == 0) return ReadStatus::Eof;
+  if (got == 0) {
+    // Clean EOF: the whole file has been consumed.
+    bytes_consumed_ = file_size_;
+    return ReadStatus::Eof;
+  }
   if (got < prefix.size()) {
     detail = "partial record prefix";
     damaged_ = true;
@@ -349,6 +358,7 @@ ReadStatus CaptureReader::next(CaptureRecord& out, std::string& detail) {
 
   out.type = type;
   ++records_read_;
+  bytes_consumed_ += rec::kRecordPrefixSize + len;
   return ReadStatus::Record;
 }
 

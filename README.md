@@ -41,7 +41,10 @@ Protobuf-Nachrichten an verbundene Clients gesendet werden (`--send-*`).
 Liest eine Capture-Datei oder ein ganzes Session-Verzeichnis und sendet die
 aufgezeichneten Bytes an einen Zielserver. Standardmäßig geschieht das in
 Echtzeit; `--speed` beschleunigt oder deaktiviert die Pacing-Logik. `--direction`
-wählt die aufgezeichnete Richtung (`in`, `out`, `both`).
+wählt die aufgezeichnete Richtung (`in`, `out`, `both`). Während des Abspielens
+zeigt eine permanent aktualisierte Zeile auf `stderr` den vollen Pfad der
+aktuellen Capture-Datei und den Fortschritt in Prozent ihrer Dateigröße; bei
+`--dir` zusätzlich mit `[i/N]`-Präfix.
 
 ### `passthrough`
 
@@ -370,6 +373,16 @@ Bei Typed-Framing wird die Typ-ID über die Rückrichtung der `type_map`
 `--rec` und `--dir` schließen sich gegenseitig aus; eines von beiden ist
 erforderlich. `--truncate` ist im Replay ungültig, da Replay Captures nicht
 verändert.
+
+Der Fortschritt wird immer ausgegeben (kein zusätzlicher Schalter) und auf
+`stderr` in einer einzigen, in-place aktualisierten Zeile angezeigt:
+
+```text
+recordings/session-.../capture-000001.pcr  37%
+[2/3] recordings/session-.../capture-000002.pcr  81%
+```
+
+Der Prozentwert bezieht sich auf die Gesamtgröße der jeweiligen Datei.
 
 ### Passthrough-Optionen
 

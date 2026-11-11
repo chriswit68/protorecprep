@@ -272,6 +272,8 @@ def test_single_file(binary: str, workdir: str) -> None:
     check(result.returncode == 0, f"replay failed: {result.stderr}")
     check(connections == 1, f"expected one replay connection, got {connections}")
     check(received == expected, f"byte mismatch: got {len(received)}, expected {len(expected)}")
+    check(files[0] in result.stderr, f"progress line missing capture path: {result.stderr!r}")
+    check("100%" in result.stderr, f"progress did not reach 100%: {result.stderr!r}")
 
 
 def test_multi_chunk(binary: str, workdir: str) -> None:
@@ -288,6 +290,11 @@ def test_multi_chunk(binary: str, workdir: str) -> None:
     check(result.returncode == 0, f"replay failed: {result.stderr}")
     check(connections == 1, f"stream was split across {connections} connections")
     check(received == expected, f"multi-chunk byte mismatch: got {len(received)}, expected {len(expected)}")
+    check(all(path in result.stderr for path in files), f"progress lines missing files: {result.stderr!r}")
+    check(
+        f"[1/{len(files)}]" in result.stderr and f"[{len(files)}/{len(files)}]" in result.stderr,
+        f"multi-file progress prefix missing: {result.stderr!r}",
+    )
 
 
 def test_multi_stream(binary: str, workdir: str) -> None:

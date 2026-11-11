@@ -400,7 +400,11 @@ Der `ReplayRunner` liest die Capture-Dateien sequenziell, rekonstruiert eine
 monotone Timeline aus den aufgezeichneten Wall-Clock-Zeitstempeln und sendet
 Datenrecords über je eine `ClientConnection` pro Stream. Backpressure verhindert
 unbegrenztes Vorauslesen; beschädigte Dateien werden standardmäßig als gültiges
-Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch.
+Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch. Während des
+Abspielens zeigt der Runner auf `stderr` eine in-place aktualisierte Zeile mit
+dem Pfad der aktuellen Capture-Datei und dem prozentualen Lese-Fortschritt
+(`CaptureReader::bytes_consumed() / file_size()`), bei mehreren Chunks ergänzt
+um `[i/N]`.
 
 ### 5.3 Klassenbeschreibungen
 
@@ -556,9 +560,9 @@ Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch.
 - **Verantwortung:** Sequenzielles, CRC-validierendes Lesen einer
   `.pcr`-Datei.
 - **Zustand:** `FILE*`, Pfad, Header, Payload-Puffer, Schadensflag,
-  Record-Zähler.
+  Record-Zähler, Dateigröße, bereits konsumierte Bytes.
 - **Wichtige Methoden:** `open()`, `next()`, `close()`, `header()`,
-  `records_read()`.
+  `records_read()`, `bytes_consumed()`, `file_size()`.
 - **Rückgaben:** `ReadStatus::Record`, `Eof`, `Damaged`, `Error`.
 - **Invarianten:** Ein Schaden wird genau einmal gemeldet; der nächste Aufruf
   liefert `Eof`, damit der Aufrufer mit dem nächsten Chunk fortfahren kann.
@@ -568,11 +572,13 @@ Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch.
 - **Verantwortung:** Replay-Engine mit Timeline, Pacing, Verbindungsaufbau,
   Reconnect und Abschlusskontrolle.
 - **Zustand:** Optionen, Strand, Timer, Watchdog, Schema, Dateiliste,
-  aktueller Record, Timeline, Stream-Metadaten, Client-Map, Statistiken.
+  aktueller Record, Timeline, Stream-Metadaten, Client-Map, Statistiken,
+  Fortschritts-Throttle.
 - **Wichtige Methoden:** `prepare()`, `open_next_file()`,
   `validate_schema()`, `load_next_record()`, `compute_schedule()`,
   `schedule_current()`, `dispatch_current()`, `make_client()`,
-  `on_client_error()`, `begin_finish()`, `complete()`.
+  `on_client_error()`, `begin_finish()`, `complete()`,
+  `begin_progress()`, `update_progress()`, `finish_progress()`.
 - **Invarianten:** Pro aufgezeichnetem Stream höchstens eine aktive
   `ClientConnection`; Pacing wird nach Rückstau neu synchronisiert; beim
   Abschluss wird auf das Leeren aller Queues gewartet (Watchdog 30 s).
@@ -1006,6 +1012,12 @@ sequenceDiagram
   RR->>CC: close_after_flush für alle
   RR->>RR: Watchdog 30 s, dann Exit
 ```
+
+Während der Schleife aktualisiert der Runner eine Fortschrittszeile auf
+`stderr`: voller Pfad des aktuellen Chunks und Prozent aus
+`CaptureReader::bytes_consumed() / file_size()`, gedrosselt auf höchstens alle
+100 ms. Bei `--dir` steht `[i/N]` davor; Log-Meldungen beenden die Zeile
+vorher, am Dateiende wird sie mit `100%` abgeschlossen.
 
 Pacing-Regeln:
 

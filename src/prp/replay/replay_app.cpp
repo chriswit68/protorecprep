@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
@@ -40,6 +41,7 @@ constexpr size_t kStreamQueueLimit = 256ull * 1024 * 1024;
 constexpr auto kBackpressureRetry = std::chrono::milliseconds(5);
 constexpr auto kFinishTimeout = std::chrono::seconds(30);
 constexpr unsigned kMaxReconnects = 10;
+constexpr int64_t kProgressIntervalNs = 100'000'000;  // refresh at most every 100 ms
 
 bool selected_direction(const Options& options, Direction dir) {
   switch (options.replay_direction) {
@@ -145,6 +147,45 @@ class ReplayRunner {
     load_next_record();
   }
 
+  std::string progress_prefix() const {
+    if (files_.size() <= 1) return {};
+    return "[" + std::to_string(file_index_ + 1) + "/" + std::to_string(files_.size()) + "] ";
+  }
+
+  // Refreshes the one-line progress display for the current capture file.
+  // `force` bypasses the throttle (used for the first and last update).
+  void update_progress(bool force = false) {
+    if (!reader_.is_open()) return;
+    const uint64_t size = reader_.file_size();
+    unsigned percent = 100;
+    if (size > 0) {
+      const uint64_t consumed = std::min(reader_.bytes_consumed(), size);
+      percent = static_cast<unsigned>(consumed * 100 / size);
+      if (percent > 100) percent = 100;
+    }
+    const int64_t now = now_monotonic_ns();
+    if (!force) {
+      if (static_cast<int>(percent) == last_progress_percent_) return;
+      if (now - last_progress_ns_ < kProgressIntervalNs) return;
+    }
+    last_progress_percent_ = static_cast<int>(percent);
+    last_progress_ns_ = now;
+    char tail[16];
+    std::snprintf(tail, sizeof(tail), "%3u%%", percent);
+    set_progress_line(progress_prefix() + reader_.path().string() + " " + tail);
+  }
+
+  void begin_progress() {
+    last_progress_percent_ = -1;
+    last_progress_ns_ = 0;
+    update_progress(true);
+  }
+
+  void finish_progress() {
+    if (reader_.is_open()) update_progress(true);
+    clear_progress_line();
+  }
+
   bool open_next_file() {
     while (file_index_ < files_.size()) {
       const fs::path& path = files_[file_index_];
@@ -186,6 +227,7 @@ class ReplayRunner {
 
       log_printf(LogLevel::Debug, "opened capture %s (%llu record(s) so far)",
                  path.string().c_str(), static_cast<unsigned long long>(records_read_));
+      begin_progress();
       file_has_trailer_ = false;
       ++valid_files_;
       return true;
@@ -226,6 +268,7 @@ class ReplayRunner {
       const ReadStatus status = reader_.next(record, detail);
       if (status == ReadStatus::Record) {
         ++records_read_;
+        update_progress();
         if (record.type == rec::RecordType::Trailer) file_has_trailer_ = true;
         current_ = std::move(record);
         have_current_ = true;
@@ -234,6 +277,7 @@ class ReplayRunner {
         return;
       }
       if (status == ReadStatus::Eof) {
+        finish_progress();
         const std::string path = reader_.path().string();
         if (!file_has_trailer_) {
           const std::string message =
@@ -252,6 +296,7 @@ class ReplayRunner {
         continue;
       }
 
+      finish_progress();
       const std::string message =
           reader_.path().string() + ": damaged capture at record " +
           std::to_string(reader_.records_read()) + ": " + detail;
@@ -468,6 +513,7 @@ class ReplayRunner {
 
   void complete(int code, std::string failure) {
     if (completed_) return;
+    clear_progress_line();
     completed_ = true;
     exit_code_ = code;
     if (!failure.empty() && failure_.empty()) failure_ = std::move(failure);
@@ -503,6 +549,9 @@ class ReplayRunner {
   bool have_timeline_ = false;
   int64_t last_ts_ns_ = 0;
   int64_t timeline_ns_ = 0;
+
+  int last_progress_percent_ = -1;
+  int64_t last_progress_ns_ = 0;
 
   std::map<uint32_t, StreamMeta> streams_;
   std::map<uint32_t, std::shared_ptr<ClientConnection>> stream_clients_;

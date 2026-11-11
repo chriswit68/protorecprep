@@ -91,6 +91,11 @@ docker compose run --rm protorecprep \
 Alternativ kann das Kommando dauerhaft in `compose.yaml` geändert werden
 (`command:`).
 
+Während des Replays aktualisiert die App eine Zeile auf `stderr`, die den
+aktuellen Capture-Pfad und den Fortschritt in Prozent der jeweiligen
+Dateigröße zeigt (bei `--dir` mit `[i/N]`-Präfix). `docker compose run`
+reicht `stderr` durch; mit `-T` bleibt die Ausgabe ebenfalls sichtbar.
+
 ## Typed-Header-Protokoll (8 Byte)
 
 Für Server mit dem 8-Byte-Header wird `framing = typed-length-le` gesetzt.
