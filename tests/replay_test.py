@@ -61,6 +61,7 @@ class SinkServer:
         self._data = bytearray()
         self._buffers: list[bytearray] = []
         self._connections = 0
+        self._closed_connections = 0
         self._stop = False
         self._handlers: list[threading.Thread] = []
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -98,6 +99,8 @@ class SinkServer:
                     buffer.extend(chunk)
                     self._data.extend(chunk)
         finally:
+            with self._lock:
+                self._closed_connections += 1
             conn.close()
 
     def wait_bytes(self, expected: int, deadline: float) -> None:
@@ -106,6 +109,14 @@ class SinkServer:
                 if len(self._data) >= expected:
                     return
             time.sleep(0.02)
+
+    def wait_closed(self, expected: int, deadline: float) -> bool:
+        while time.time() < deadline:
+            with self._lock:
+                if self._closed_connections >= expected:
+                    return True
+            time.sleep(0.02)
+        return False
 
     def data(self) -> bytes:
         with self._lock:
@@ -120,6 +131,11 @@ class SinkServer:
     def connections(self) -> int:
         with self._lock:
             return self._connections
+
+    @property
+    def closed_connections(self) -> int:
+        with self._lock:
+            return self._closed_connections
 
     def close(self) -> None:
         self._stop = True

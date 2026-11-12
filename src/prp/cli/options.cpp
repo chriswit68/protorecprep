@@ -55,7 +55,8 @@ bool parse_bool_value(std::string_view text, bool& out) {
 bool is_boolean_key(const std::string& key) {
   return key == "flat" || key == "durable" || key == "json" || key == "json-chunks" ||
          key == "json-print-defaults" || key == "json-preserve-names" || key == "truncate" ||
-         key == "reconnect" || key == "strict" || key == "quiet" || key == "verbose";
+         key == "reconnect" || key == "link-connections" || key == "strict" || key == "quiet" ||
+         key == "verbose";
 }
 
 // Reads a .ini file into CLI-style arguments. Keys are long option names
@@ -130,6 +131,8 @@ bool load_ini_config(const fs::path& path, std::vector<std::string>& args, std::
         args.push_back("--" + key);
       } else if (key == "flat") {
         args.push_back("--no-flat");
+      } else if (key == "link-connections") {
+        args.push_back("--no-link-connections");
       }
       continue;
     }
@@ -625,6 +628,10 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       }
     } else if (key == "--reconnect") {
       out.reconnect = true;
+    } else if (key == "--link-connections") {
+      out.link_connections = true;
+    } else if (key == "--no-link-connections") {
+      out.link_connections = false;
     } else if (key == "--connect-timeout") {
       if (!need_duration(out.connect_timeout)) return false;
     } else if (key == "--connect-retries") {
@@ -683,6 +690,13 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
   // silently ignoring the requested mode.
   if (out.progress_set && out.command != "replay") {
     err = "--progress is only valid for replay";
+    return false;
+  }
+
+  // Connection coupling only exists where a passthrough forwarder is attached
+  // to an accepted client stream.
+  if (out.link_connections && out.command != "passthrough") {
+    err = "--link-connections is only valid for passthrough";
     return false;
   }
 
@@ -954,6 +968,9 @@ void print_help() {
       "  --connect-retries <n>       Total connect attempts (default 5)\n"
       "  --retry-interval <dur>      Delay between connect attempts (default 1s)\n"
       "  --reconnect                 Resume after a mid-stream connection loss\n"
+      "  --link-connections          Couple both connections: when either side ends,\n"
+      "                              the other is stopped immediately. Takes precedence\n"
+      "                              over --reconnect. (default off)\n"
       "  --io-threads <n>            IO worker threads (default auto)\n"
       "\n"
       "  Target responses are forwarded live to the client and are always\n"

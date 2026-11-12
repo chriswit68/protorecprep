@@ -26,6 +26,7 @@ const char* close_reason_name(CloseReason reason) {
     case CloseReason::Overflow: return "overflow";
     case CloseReason::AcceptRejected: return "accept_rejected";
     case CloseReason::SendError: return "send_error";
+    case CloseReason::ForwardError: return "forward_error";
   }
   return "unknown";
 }

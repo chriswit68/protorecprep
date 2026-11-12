@@ -20,6 +20,7 @@ enum class CloseReason : uint8_t {
   Overflow = 5,
   AcceptRejected = 6,
   SendError = 7,
+  ForwardError = 8,
 };
 
 const char* close_reason_name(CloseReason reason);

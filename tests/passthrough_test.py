@@ -101,6 +101,21 @@ def recv_until(sock: socket.socket, expected: int, deadline: float) -> bytes:
     return bytes(data)
 
 
+def wait_socket_closed(sock: socket.socket, deadline: float) -> bool:
+    """Waits until the peer closes the connection, discarding late data."""
+    sock.settimeout(0.2)
+    while time.time() < deadline:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            continue
+        except OSError:
+            return True
+        if not chunk:
+            return True
+    return False
+
+
 def start_passthrough(
     binary: str,
     out_dir: str,
@@ -384,6 +399,99 @@ def test_target_eof_keeps_client(binary: str, workdir: str) -> None:
           f"inbound data after target EOF was lost: got {len(recorded)}, expected {len(expected)}")
 
 
+def test_link_client_abort_closes_target(binary: str, workdir: str) -> None:
+    out_dir = os.path.join(workdir, "link-client-abort")
+    sink = SinkServer()
+    listen_port = pick_port()
+    proc, stderr_file, stderr_path = start_passthrough(
+        binary, out_dir, listen_port, sink.port, extra_args=["--link-connections"]
+    )
+    payload = b"linked-client-abort"
+    try:
+        sock = wait_for_server(listen_port, time.time() + 10.0)
+        sock.sendall(payload)
+        sink.wait_bytes(len(payload), time.time() + 10.0)
+        check(sink.data() == payload, f"forwarded bytes differ: {sink.data()!r}")
+        sock.close()
+        check(sink.wait_closed(1, time.time() + 5.0),
+              "target connection stayed open after the client disconnected")
+        check(sink.connections == 1, f"expected one target connection, got {sink.connections}")
+    finally:
+        finish_passthrough(proc, stderr_file, stderr_path)
+        sink.close()
+    verify_recording(binary, out_dir, payload)
+
+
+def test_link_target_close_closes_client(binary: str, workdir: str) -> None:
+    out_dir = os.path.join(workdir, "link-target-close")
+    response = b"linked-target-response"
+    sink = RespondingServer(response, close_after_response=True)
+    listen_port = pick_port()
+    # --reconnect must not keep the client alive: coupling takes precedence.
+    proc, stderr_file, stderr_path = start_passthrough(
+        binary,
+        out_dir,
+        listen_port,
+        sink.port,
+        extra_args=["--link-connections", "--reconnect"],
+    )
+    first = b"first-request"
+    second = b"second-request"
+    try:
+        sock = wait_for_server(listen_port, time.time() + 10.0)
+        sock.sendall(first)
+        received = recv_until(sock, len(response), time.time() + 10.0)
+        check(received == response, f"response differs: {received!r}")
+        check(wait_socket_closed(sock, time.time() + 5.0),
+              "client connection stayed open after the target closed")
+        sock.close()
+
+        # Reconnecting the client must open a fresh target connection.
+        again = wait_for_server(listen_port, time.time() + 10.0)
+        again.sendall(second)
+        sink.wait_bytes(len(first) + len(second), time.time() + 10.0)
+        check(again.recv(65536) == response, "reconnected client did not get the target response")
+        again.close()
+        check(sink.connections >= 2,
+              f"reconnect did not open a fresh target connection ({sink.connections})")
+    finally:
+        output = finish_passthrough(proc, stderr_file, stderr_path)
+        sink.close()
+    check("closing client connection" in output,
+          f"missing coupled forward failure warning: {output}")
+
+
+def test_link_unreachable_target_closes_client(binary: str, workdir: str) -> None:
+    out_dir = os.path.join(workdir, "link-unreachable")
+    dead_port = pick_port()
+    listen_port = pick_port()
+    proc, stderr_file, stderr_path = start_passthrough(
+        binary,
+        out_dir,
+        listen_port,
+        dead_port,
+        extra_args=[
+            "--link-connections",
+            "--connect-timeout", "100ms",
+            "--connect-retries", "1",
+            "--retry-interval", "10ms",
+        ],
+    )
+    payload = b"recorded-despite-client-disconnect"
+    try:
+        sock = wait_for_server(listen_port, time.time() + 10.0)
+        sock.sendall(payload)
+        check(wait_socket_closed(sock, time.time() + 5.0),
+              "client connection stayed open after the target was unreachable")
+        sock.close()
+        time.sleep(0.2)
+    finally:
+        output = finish_passthrough(proc, stderr_file, stderr_path)
+    check("closing client connection" in output,
+          f"missing coupled forward failure warning: {output}")
+    verify_recording(binary, out_dir, payload)
+
+
 def test_response_backpressure(binary: str, workdir: str) -> None:
     out_dir = os.path.join(workdir, "response-backpressure")
     chunk = b"server-response-block-"
@@ -508,6 +616,9 @@ def main() -> int:
         test_multi_stream(binary, workdir)
         test_response_forwarding(binary, workdir)
         test_target_eof_keeps_client(binary, workdir)
+        test_link_client_abort_closes_target(binary, workdir)
+        test_link_target_close_closes_client(binary, workdir)
+        test_link_unreachable_target_closes_client(binary, workdir)
         test_response_backpressure(binary, workdir)
         test_unreachable_target(binary, workdir)
         test_backpressure(binary, workdir)

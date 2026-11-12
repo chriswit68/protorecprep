@@ -103,6 +103,7 @@ struct Options {
 
   // passthrough
   size_t forward_queue = 16ull * 1024 * 1024;  // per-stream backlog before reads pause
+  bool link_connections = false;  // close the other side when one connection ends
 
   // inspect / replay
   fs::path input_file;  // --rec

@@ -406,10 +406,24 @@ Alle Record-Optionen außer `--send-*` gelten auch hier.
 | `--connect-retries <n>` | `5` | Anzahl der Verbindungsversuche |
 | `--retry-interval <dur>` | `1s` | Pause zwischen Verbindungsversuchen |
 | `--reconnect` | `false` | Nach Abbruch erneut zum Ziel verbinden |
+| `--link-connections` | `false` | Client- und Zielverbindung koppeln: endet eine Seite, wird die andere sofort beendet; hat Vorrang vor `--reconnect` |
 | `--io-threads <n>` | automatisch | Anzahl der IO-Threads |
 
 Das Ziel darf nicht auf den eigenen Listener zeigen. `--speed`, `--direction`,
 `--max-gap`, `--strict`, `--rec`, `--dir` und `--truncate` sind hier ungültig.
+
+Mit `--link-connections` werden beide Verbindungen als Einheit behandelt:
+
+- Schließt der Client, wird die Zielverbindung sofort abgebrochen. Noch nicht
+  weitergeleitete Bytes werden verworfen; sie bleiben aber vollständig in der
+  Aufzeichnung erhalten.
+- Bricht die Zielverbindung ab, wird auch die Clientverbindung geschlossen.
+  Der Client kann neu verbinden; dabei entsteht eine frische Zielverbindung.
+- Die Kopplung hat Vorrang vor `--reconnect`; ein interner Ziel-Reconnect
+  findet dann nicht statt.
+
+`--no-link-connections` deaktiviert die Kopplung wieder (nützlich, um einen
+INI-Wert per Kommandozeile zu überschreiben).
 
 ### Inspect-Optionen
 
@@ -549,7 +563,7 @@ Beispiele:
 
 Mögliche `reason`-Werte bei `stream_close`: `peer_closed`, `local_shutdown`,
 `protocol_error`, `idle_timeout`, `server_shutdown`, `overflow`,
-`accept_rejected`, `send_error`.
+`accept_rejected`, `send_error`, `forward_error`.
 
 ## Capture-Format (`.pcr`)
 

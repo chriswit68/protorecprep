@@ -68,6 +68,7 @@ Anwendungsprozess abstürzt.
 | FR-13 | Ausgehende Nachrichten an Clients | `SendSpec`, Timer, `frame_message()`/`frame_typed_message()` |
 | FR-14 | Betrieb im Container ohne Host-Abhängigkeiten | `Dockerfile`, `compose.yaml`, `etc/docker.ini` |
 | FR-15 | Schema-Validierung beim Replay | SHA-256 im Datei-Header, `ReplayRunner::validate_schema()` |
+| FR-16 | Optionale Kopplung von Client- und Zielverbindung im Passthrough | `--link-connections`, `CloseReason::ForwardError` |
 
 ### 1.3 Qualitätsziele
 
@@ -613,8 +614,10 @@ Log-Pipelines nur an `\n` trennen.
 - **Wichtige Methoden:** `forward()`, `close()`, `abort()`,
   `pause_responses()`, `resume_responses()`, `set_*_callback()`.
 - **Invarianten:** Verbindung wird lazy beim ersten Byte geöffnet; ein
-  Forwarding-Fehler schließt den Quell-Stream nicht; gepufferte Bytes werden
-  beim Schließen noch geflusht, sofern möglich.
+  Forwarding-Fehler schließt den Quell-Stream standardmäßig nicht. Mit
+  `link_connections` beendet der Aufrufer den Quell-Stream, und interne
+  Reconnects sind deaktiviert. Gepufferte Bytes werden beim Schließen noch
+  geflusht, sofern nicht die Kopplung ein sofortiges Abbrechen verlangt.
 - **Threading:** Alle Methoden laufen auf dem Session-Strand.
 
 #### Format- und Hilfstypen
@@ -627,7 +630,7 @@ Log-Pipelines nur an `\n` trennen.
 | `rec::TrailerInfo` | Record-/Byte-Zähler, Clean-Flag, Endzeit |
 | `rec::StreamOpenInfo` / `DataInfo` / `StreamCloseInfo` | Dekodierte Payloads für Replay und Inspect |
 | `SendSpec` | Vorbereitete, bereits geframte Nachricht plus Zeitplan |
-| `ForwardConfig` | Ziel, Timeouts, Retries, Queue-Limit, Reconnect |
+| `ForwardConfig` | Ziel, Timeouts, Retries, Queue-Limit, Reconnect, Verbindungskopplung |
 | `JsonWriterConfig` | Schema, Typ-Map, Blob-Verzeichnis, Chunk-Modus/-Verzeichnis, Inline-Grenze, Formatierung |
 | `ScanStats` | Ergebnis von `inspect`: Header, Zähler, Trailer, Schaden, gültiges Ende |
 | `CaptureRecord` | Ein dekodierter Datensatz für den Replay-Pfad |
@@ -1446,10 +1449,15 @@ Zusätzlich: reale Referenzdaten in `tests/events.jsonl`, Benchmark über
 ### ADR-10: Forwarding isoliert von der Aufzeichnung
 
 - **Kontext:** Passthrough-Ziele können ausfallen.
-- **Entscheidung:** Forwarding-Fehler beeinflussen den Source-Stream nicht.
+- **Entscheidung:** Forwarding-Fehler beeinflussen den Source-Stream
+  standardmäßig nicht.
 - **Folgen:** Aufzeichnung bleibt robust; Weiterleitung ist best effort.
-- **Alternativen:** Bei Forwarding-Fehler Verbindung schließen (verworfen:
-  Datenverlust).
+  Optional koppelt `--link-connections` beide Verbindungen: ein Zielausfall
+  schließt den Client (`CloseReason::ForwardError`) und beendet interne
+  Reconnects, damit der Client die Verbindung sauber neu aufbauen kann.
+- **Alternativen:** Kopplung immer aktiv (verworfen: Datenverlust/Verhalten
+  ändert sich für bestehende Aufnahmen), Kopplung nur nach erschöpften
+  Reconnects (verworfen: kein sofortiger sauberer Neuaufbau).
 
 ### ADR-11: Docker baut Abhängigkeiten aus Quellcode
 
@@ -1531,7 +1539,7 @@ flowchart TD
 | QS-04 | Prozess wird mit `SIGTERM` beendet | Trailer + Summaries geschrieben | Integrationstest |
 | QS-05 | Stromausfall mitten im Schreiben | `inspect` erkennt Tail, `--truncate` repariert | Recovery-Test |
 | QS-06 | Replay mit falschem Schema | Warnung oder Abbruch mit `--strict` | `replay`-Test |
-| QS-07 | Zielserver im Passthrough nicht erreichbar | Aufzeichnung läuft weiter | `passthrough`-Test |
+| QS-07 | Zielserver im Passthrough nicht erreichbar | Ohne `--link-connections` läuft die Aufzeichnung weiter; mit Kopplung wird der Client getrennt | `passthrough`-Test |
 | QS-08 | Reale Blob-Aufnahme mit 103 Frames | 59 pcap, 32 wav, 12 text, byte-genau | `tests/events.jsonl` |
 | QS-09 | Containerstart ohne Host-Protobuf | App läuft | `docker compose up` |
 | QS-10 | 1 GiB Daten, 1 MiB Batch | Stabiler Durchsatz, begrenzter Speicher | Benchmark |

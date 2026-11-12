@@ -541,14 +541,15 @@ void test_passthrough_options() {
     prp::Options options;
     std::string err;
     CHECK(parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "127.0.0.1:7000",
-                 "--forward-queue", "2MiB", "--reconnect", "--connect-timeout", "250ms",
-                 "--connect-retries", "3", "--retry-interval", "10ms"},
+                 "--forward-queue", "2MiB", "--reconnect", "--link-connections",
+                 "--connect-timeout", "250ms", "--connect-retries", "3", "--retry-interval", "10ms"},
                 options, err));
     CHECK_EQ(options.command, std::string("passthrough"));
     CHECK_EQ(options.target_host, std::string("127.0.0.1"));
     CHECK_EQ(options.target_port, uint16_t{7000});
     CHECK_EQ(options.forward_queue, size_t{2} * 1024 * 1024);
     CHECK(options.reconnect);
+    CHECK(options.link_connections);
     CHECK_EQ(options.connect_timeout.count(), int64_t{250});
     CHECK_EQ(options.connect_retries, uint64_t{3});
     CHECK_EQ(options.retry_interval.count(), int64_t{10});
@@ -559,6 +560,24 @@ void test_passthrough_options() {
     CHECK(parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1"}, options,
                 err));
     CHECK_EQ(options.forward_queue, size_t{16} * 1024 * 1024);
+    CHECK(!options.link_connections);
+    CHECK(parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1",
+                 "--link-connections", "--no-link-connections"},
+                options, err));
+    CHECK(!options.link_connections);
+  }
+  {
+    // Coupling only exists in passthrough mode.
+    prp::Options options;
+    std::string err;
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/out", "--link-connections"}, options,
+                 err));
+    CHECK(err.find("--link-connections") != std::string::npos);
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1",
+                  "--link-connections"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "inspect", "--rec", "a.pcr", "--link-connections"}, options,
+                 err));
   }
   {
     prp::Options options;
@@ -618,6 +637,7 @@ void test_passthrough_options() {
                                  "target = 127.0.0.1:7100\n"
                                  "forward_queue = 3MiB\n"
                                  "reconnect = true\n"
+                                 "link_connections = true\n"
                                  "connect_retries = 4\n",
                                  err));
     prp::Options options;
@@ -625,7 +645,13 @@ void test_passthrough_options() {
     CHECK_EQ(options.target_port, uint16_t{7100});
     CHECK_EQ(options.forward_queue, size_t{3} * 1024 * 1024);
     CHECK(options.reconnect);
+    CHECK(options.link_connections);
     CHECK_EQ(options.connect_retries, uint64_t{4});
+
+    // The CLI can switch the option off again even if the INI enables it.
+    CHECK(parse({"protorecprep", "passthrough", "--config", ini.string(), "--no-link-connections"},
+                options, err));
+    CHECK(!options.link_connections);
     std::filesystem::remove_all(dir);
   }
 }

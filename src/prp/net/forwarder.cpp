@@ -115,7 +115,7 @@ void SessionForwarder::handle_closed() {
 void SessionForwarder::handle_error(const std::string& message) {
   if (closed_) return;
 
-  if (config_.reconnect && client_ && client_->connects() > 0 &&
+  if (config_.reconnect && !config_.link_connections && client_ && client_->connects() > 0 &&
       reconnects_ < config_.max_reconnects) {
     ++reconnects_;
     log_printf(LogLevel::Warn, "lost connection to %s:%u (%s), reconnecting (%u/%u)",
@@ -126,8 +126,14 @@ void SessionForwarder::handle_error(const std::string& message) {
   }
 
   failed_ = true;
-  log_printf(LogLevel::Warn, "forwarding to %s:%u stopped: %s (recording continues)",
-             config_.host.c_str(), static_cast<unsigned>(config_.port), message.c_str());
+  if (config_.link_connections) {
+    log_printf(LogLevel::Warn,
+               "forwarding to %s:%u stopped: %s (closing client connection)",
+               config_.host.c_str(), static_cast<unsigned>(config_.port), message.c_str());
+  } else {
+    log_printf(LogLevel::Warn, "forwarding to %s:%u stopped: %s (recording continues)",
+               config_.host.c_str(), static_cast<unsigned>(config_.port), message.c_str());
+  }
   if (client_) client_->abort();
   invoke_error(message);
 }

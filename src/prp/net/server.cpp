@@ -313,9 +313,15 @@ class Session : public std::enable_shared_from_this<Session> {
     log_printf(LogLevel::Debug, "stream %u closed (%s)", id_, close_reason_name(reason));
 
     // Keep the session (and its captured stream metadata) alive until the
-    // forwarding backlog has drained. Recording has already been committed.
+    // forwarding backlog has drained. With --link-connections the client is
+    // already gone, so the target connection is stopped immediately instead of
+    // flushing a stale backlog.
     if (forwarder_ && forwarder_->active()) {
-      forwarder_->close();
+      if (server_.config().forward.link_connections) {
+        forwarder_->abort();
+      } else {
+        forwarder_->close();
+      }
       arm_forward_watchdog();
       return;
     }
@@ -330,9 +336,16 @@ class Session : public std::enable_shared_from_this<Session> {
   }
 
   void on_forward_error() {
+    if (closing_) return;
+    // With coupled connections the target failure also ends the client stream.
+    // The client can reconnect, which opens a fresh target connection.
+    if (server_.config().forward.link_connections) {
+      do_close(CloseReason::ForwardError);
+      return;
+    }
     // Forwarding stopped, but recording continues. Release any backpressure
     // that was imposed by the forwarding queue.
-    if (closing_ || !paused_) return;
+    if (!paused_) return;
     paused_ = false;
     arm_idle_timer();
     do_read();

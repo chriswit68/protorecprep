@@ -148,6 +148,8 @@ std::string meta_json(const Options& options, const Schema& schema, const fs::pa
           "\",\n";
   json += "    \"queue_bytes\": " + std::to_string(forward.queue_limit) + ",\n";
   json += "    \"reconnect\": " + std::string(forward.reconnect ? "true" : "false") + ",\n";
+  json += "    \"link_connections\": " +
+          std::string(forward.link_connections ? "true" : "false") + ",\n";
   json += "    \"connect_timeout_ms\": " + std::to_string(forward.connect_timeout.count()) + ",\n";
   json += "    \"connect_retries\": " + std::to_string(forward.connect_retries) + ",\n";
   json += "    \"retry_interval_ms\": " + std::to_string(forward.retry_interval.count()) + "\n";
@@ -405,6 +407,7 @@ int run_server_mode(const Options& options, std::string& err) {
     server_config.forward.retry_interval = options.retry_interval;
     server_config.forward.connect_retries = options.connect_retries;
     server_config.forward.reconnect = options.reconnect;
+    server_config.forward.link_connections = options.link_connections;
     server_config.forward.queue_limit = options.forward_queue;
   }
 

@@ -22,14 +22,18 @@ struct ForwardConfig {
   std::chrono::milliseconds retry_interval{1000};
   uint64_t connect_retries = 5;
   bool reconnect = false;
+  // When true, a target failure stops the owning source stream instead of only
+  // stopping forwarding (and takes precedence over reconnect).
+  bool link_connections = false;
   size_t queue_limit = 16ull * 1024 * 1024;
   unsigned max_reconnects = 10;
 };
 
 // Forwards inbound client bytes to a target server over one lazily opened TCP
 // connection per source stream, and (optionally) forwards raw target responses
-// back to the client. Recording and forwarding are independent: a forwarding
-// failure never closes the source stream.
+// back to the client. Recording and forwarding are independent by default: a
+// forwarding failure never closes the source stream. With link_connections the
+// caller tears the source stream down on a forwarding failure.
 //
 // Thread-safety: the constructor takes the executor that runs the owning
 // session's strand. All public methods must be called from that executor, and
