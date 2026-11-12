@@ -633,6 +633,18 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       if (!need_duration(out.retry_interval)) return false;
     } else if (key == "--max-gap") {
       if (!need_duration(out.max_gap)) return false;
+    } else if (key == "--progress") {
+      std::string text;
+      if (!need_value(text)) return false;
+      if (text == "auto") out.progress = ProgressMode::Auto;
+      else if (text == "line") out.progress = ProgressMode::Line;
+      else if (text == "inline") out.progress = ProgressMode::Inline;
+      else if (text == "off") out.progress = ProgressMode::Off;
+      else {
+        err = "invalid --progress value (auto|line|inline|off): " + text;
+        return false;
+      }
+      out.progress_set = true;
     } else if (key == "--forward-queue") {
       size_t queue_bytes = 0;
       if (!need_size(queue_bytes)) return false;
@@ -666,6 +678,13 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
   }
 
   if (out.help) return true;
+
+  // Progress reporting is a replay-only concern; reject it elsewhere instead of
+  // silently ignoring the requested mode.
+  if (out.progress_set && out.command != "replay") {
+    err = "--progress is only valid for replay";
+    return false;
+  }
 
   // JSON output is chunked (one capture-NNNNNN.jsonl per capture chunk) unless
   // an explicit --json-file selects a single session-wide file. Combining an
@@ -918,6 +937,9 @@ void print_help() {
       "  --retry-interval <dur>      Delay between connect attempts (default 1s)\n"
       "  --reconnect                 Resume after a mid-stream connection loss\n"
       "  --max-gap <dur>             Cap idle gaps between records (default off)\n"
+      "  --progress <mode>           Per-file progress on stderr: auto|line|inline|off\n"
+      "                              (default auto: in-place on a terminal, plain lines\n"
+      "                              otherwise, e.g. in containers and CI)\n"
       "  --strict                    Treat damaged/inconsistent captures as fatal\n"
       "  --io-threads <n>            IO worker threads (default auto)\n"
       "\n"

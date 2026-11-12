@@ -401,10 +401,13 @@ monotone Timeline aus den aufgezeichneten Wall-Clock-Zeitstempeln und sendet
 Datenrecords über je eine `ClientConnection` pro Stream. Backpressure verhindert
 unbegrenztes Vorauslesen; beschädigte Dateien werden standardmäßig als gültiges
 Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch. Während des
-Abspielens zeigt der Runner auf `stderr` eine in-place aktualisierte Zeile mit
-dem Pfad der aktuellen Capture-Datei und dem prozentualen Lese-Fortschritt
+Abspielens meldet der Runner den Fortschritt auf `stderr`: den Pfad der
+aktuellen Capture-Datei und den prozentualen Lese-Fortschritt
 (`CaptureReader::bytes_consumed() / file_size()`), bei mehreren Chunks ergänzt
-um `[i/N]`.
+um `[i/N]`. Das Format hängt von `--progress` ab: im Terminal eine in-place
+aktualisierte Zeile, ohne Terminal vollständige, mit `\n` abgeschlossene
+Logzeilen (höchstens eine pro Sekunde), weil Docker-Compose und andere
+Log-Pipelines nur an `\n` trennen.
 
 ### 5.3 Klassenbeschreibungen
 
@@ -566,6 +569,8 @@ um `[i/N]`.
 - **Rückgaben:** `ReadStatus::Record`, `Eof`, `Damaged`, `Error`.
 - **Invarianten:** Ein Schaden wird genau einmal gemeldet; der nächste Aufruf
   liefert `Eof`, damit der Aufrufer mit dem nächsten Chunk fortfahren kann.
+  Trailer-Records liefern den Chunk-Endzeitstempel (`end_wall_ns`) als
+  `ts_ns`, damit die Pacing-Timeline über Chunk-Grenzen hinweg monoton bleibt.
 
 #### `ReplayRunner` (`prp::ReplayRunner`, intern in `replay_app.cpp`)
 
@@ -578,10 +583,12 @@ um `[i/N]`.
   `validate_schema()`, `load_next_record()`, `compute_schedule()`,
   `schedule_current()`, `dispatch_current()`, `make_client()`,
   `on_client_error()`, `begin_finish()`, `complete()`,
-  `begin_progress()`, `update_progress()`, `finish_progress()`.
+  `configure_progress()`, `begin_progress()`, `update_progress()`,
+  `finish_progress()`.
 - **Invarianten:** Pro aufgezeichnetem Stream höchstens eine aktive
-  `ClientConnection`; Pacing wird nach Rückstau neu synchronisiert; beim
-  Abschluss wird auf das Leeren aller Queues gewartet (Watchdog 30 s).
+  `ClientConnection`; Pacing wird nach Rückstau neu synchronisiert; Records
+  ohne Wall-Clock-Zeitstempel (`ts_ns <= 0`) verändern die Timeline nicht;
+  beim Abschluss wird auf das Leeren aller Queues gewartet (Watchdog 30 s).
 - **Threading:** Alle Zustandsänderungen erfolgen auf dem Runner-Strand.
 
 #### `ClientConnection` (`prp::ClientConnection`)
@@ -1013,11 +1020,14 @@ sequenceDiagram
   RR->>RR: Watchdog 30 s, dann Exit
 ```
 
-Während der Schleife aktualisiert der Runner eine Fortschrittszeile auf
-`stderr`: voller Pfad des aktuellen Chunks und Prozent aus
+Während der Schleife meldet der Runner den Fortschritt auf `stderr`: voller
+Pfad des aktuellen Chunks und Prozent aus
 `CaptureReader::bytes_consumed() / file_size()`, gedrosselt auf höchstens alle
-100 ms. Bei `--dir` steht `[i/N]` davor; Log-Meldungen beenden die Zeile
-vorher, am Dateiende wird sie mit `100%` abgeschlossen.
+100 ms im Terminal (In-Place-Zeile via `\r`) bzw. einmal pro Sekunde bei
+zeilenweiser Ausgabe (`--progress line`, `auto` ohne Terminal). Bei `--dir`
+steht `[i/N]` davor; Log-Meldungen beenden eine aktive In-Place-Zeile vorher,
+am Dateiende wird sie mit `100%` abgeschlossen. `--progress off` deaktiviert
+die Meldungen.
 
 Pacing-Regeln:
 
@@ -1025,6 +1035,9 @@ Pacing-Regeln:
 - Für jeden weiteren Record wird die Differenz der Capture-Zeitstempel durch
   `--speed` geteilt und optional durch `--max-gap` begrenzt.
 - `--speed 0` deaktiviert die Verzögerung.
+- Chunk-Grenzen erzeugen keine künstlichen Pausen: der Trailer trägt den
+  Endzeitstempel des Chunks, Records ohne Wall-Clock-Zeitstempel werden für das
+  Pacing ignoriert.
 - Bei Rückstau wird die Timeline auf „jetzt“ gesetzt, damit kein Burst
   entsteht.
 - Gesamt-High-Water: 64 MiB; pro Stream: 256 MiB.

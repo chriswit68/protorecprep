@@ -41,7 +41,8 @@ constexpr size_t kStreamQueueLimit = 256ull * 1024 * 1024;
 constexpr auto kBackpressureRetry = std::chrono::milliseconds(5);
 constexpr auto kFinishTimeout = std::chrono::seconds(30);
 constexpr unsigned kMaxReconnects = 10;
-constexpr int64_t kProgressIntervalNs = 100'000'000;  // refresh at most every 100 ms
+constexpr int64_t kProgressIntervalNs = 100'000'000;      // in-place refresh: at most every 100 ms
+constexpr int64_t kProgressLineIntervalNs = 1'000'000'000;  // line output: at most every 1 s
 
 bool selected_direction(const Options& options, Direction dir) {
   switch (options.replay_direction) {
@@ -116,6 +117,7 @@ class ReplayRunner {
   void prepare() {
     if (completed_) return;
     started_ns_ = now_monotonic_ns();
+    configure_progress();
 
     if (!options_.proto_file.empty()) {
       if (!schema_.load(options_.proto_file, options_.proto_paths, failure_)) {
@@ -147,15 +149,39 @@ class ReplayRunner {
     load_next_record();
   }
 
+  // Resolves --progress into the effective display mode. The default (Auto)
+  // keeps the in-place line on a terminal, but switches to complete log lines
+  // otherwise: Docker Compose and other log pipelines split output on '\n'
+  // only, so bare '\r' updates would stay invisible until a file finishes.
+  void configure_progress() {
+    switch (options_.progress) {
+      case ProgressMode::Off:
+        progress_enabled_ = false;
+        break;
+      case ProgressMode::Line:
+        progress_enabled_ = true;
+        inline_progress_ = false;
+        break;
+      case ProgressMode::Inline:
+        progress_enabled_ = true;
+        inline_progress_ = true;
+        break;
+      case ProgressMode::Auto:
+        progress_enabled_ = true;
+        inline_progress_ = progress_stderr_is_tty();
+        break;
+    }
+  }
+
   std::string progress_prefix() const {
     if (files_.size() <= 1) return {};
     return "[" + std::to_string(file_index_ + 1) + "/" + std::to_string(files_.size()) + "] ";
   }
 
-  // Refreshes the one-line progress display for the current capture file.
+  // Refreshes the progress display for the current capture file.
   // `force` bypasses the throttle (used for the first and last update).
   void update_progress(bool force = false) {
-    if (!reader_.is_open()) return;
+    if (!progress_enabled_ || !reader_.is_open()) return;
     const uint64_t size = reader_.file_size();
     unsigned percent = 100;
     if (size > 0) {
@@ -166,13 +192,14 @@ class ReplayRunner {
     const int64_t now = now_monotonic_ns();
     if (!force) {
       if (static_cast<int>(percent) == last_progress_percent_) return;
-      if (now - last_progress_ns_ < kProgressIntervalNs) return;
+      const int64_t interval = inline_progress_ ? kProgressIntervalNs : kProgressLineIntervalNs;
+      if (now - last_progress_ns_ < interval) return;
     }
     last_progress_percent_ = static_cast<int>(percent);
     last_progress_ns_ = now;
     char tail[16];
     std::snprintf(tail, sizeof(tail), "%3u%%", percent);
-    set_progress_line(progress_prefix() + reader_.path().string() + " " + tail);
+    set_progress_line(progress_prefix() + reader_.path().string() + " " + tail, inline_progress_);
   }
 
   void begin_progress() {
@@ -316,8 +343,14 @@ class ReplayRunner {
     const int64_t now = now_monotonic_ns();
     if (!have_timeline_) {
       have_timeline_ = true;
-      last_ts_ns_ = current_.ts_ns;
       timeline_ns_ = now;
+      // A record without a wall-clock timestamp must not become the baseline.
+      last_ts_ns_ = current_.ts_ns > 0 ? current_.ts_ns : 0;
+      return;
+    }
+    if (current_.ts_ns <= 0) return;  // no timestamp, no pacing
+    if (last_ts_ns_ <= 0) {
+      last_ts_ns_ = current_.ts_ns;  // establish the baseline late
       return;
     }
     int64_t gap = current_.ts_ns - last_ts_ns_;
@@ -552,6 +585,8 @@ class ReplayRunner {
 
   int last_progress_percent_ = -1;
   int64_t last_progress_ns_ = 0;
+  bool progress_enabled_ = true;
+  bool inline_progress_ = true;
 
   std::map<uint32_t, StreamMeta> streams_;
   std::map<uint32_t, std::shared_ptr<ClientConnection>> stream_clients_;

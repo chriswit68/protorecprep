@@ -454,6 +454,30 @@ void test_replay_options() {
     CHECK_EQ(options.replay_speed, 0.0);
   }
   {
+    // --progress selects the stderr progress style; auto is the default.
+    prp::Options options;
+    std::string err;
+    CHECK(parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1"}, options, err));
+    CHECK(options.progress == prp::ProgressMode::Auto);
+    CHECK(parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--progress",
+                 "line"},
+                options, err));
+    CHECK(options.progress == prp::ProgressMode::Line);
+    CHECK(parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--progress",
+                 "inline"},
+                options, err));
+    CHECK(options.progress == prp::ProgressMode::Inline);
+    CHECK(parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--progress",
+                 "off"},
+                options, err));
+    CHECK(options.progress == prp::ProgressMode::Off);
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--progress",
+                  "loud"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "record", "--out", "/tmp/out", "--progress", "line"}, options,
+                 err));
+  }
+  {
     prp::Options options;
     std::string err;
     CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr"}, options, err));
@@ -560,6 +584,9 @@ void test_passthrough_options() {
                   "1s"},
                  options, err));
     CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--strict"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1",
+                  "--progress", "line"},
                  options, err));
     CHECK(!parse({"protorecprep", "passthrough", "--out", "/tmp/out", "--target", "h:1", "--send-type",
                   "sample.Sample"},
@@ -980,6 +1007,9 @@ void test_capture_reader() {
           break;
         case prp::rec::RecordType::Trailer:
           ++trailers;
+          // The trailer carries the chunk end timestamp that replay uses for
+          // pacing; a zero timestamp would create a huge gap between chunks.
+          CHECK(record.ts_ns >= start + 3000);
           break;
         case prp::rec::RecordType::Marker:
           break;

@@ -352,8 +352,14 @@ ReadStatus CaptureReader::next(CaptureRecord& out, std::string& detail) {
       out.ts_ns = static_cast<int64_t>(get_u64le(payload_.data()));
       break;
     }
-    case rec::RecordType::Trailer:
+    case rec::RecordType::Trailer: {
+      // The trailer carries the chunk end timestamp. Leaving ts_ns at zero used
+      // to reset the replay timeline, so the next chunk's first record looked
+      // like a multi-decade gap (and stalled paced multi-chunk replays).
+      rec::TrailerInfo info;
+      if (rec::parse_trailer(payload_.data(), payload_.size(), info)) out.ts_ns = info.end_wall_ns;
       break;
+    }
   }
 
   out.type = type;

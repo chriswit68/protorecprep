@@ -6,6 +6,8 @@
 #include <ctime>
 #include <mutex>
 
+#include <unistd.h>
+
 namespace prp {
 namespace {
 
@@ -86,15 +88,25 @@ void clear_progress_line() {
   g_progress_active = false;
 }
 
-void set_progress_line(std::string_view text) {
+void set_progress_line(std::string_view text, bool in_place) {
   if (text.empty()) {
     clear_progress_line();
     return;
   }
   std::lock_guard<std::mutex> lock(g_mutex);
-  std::fprintf(stderr, "\r%.*s", static_cast<int>(text.size()), text.data());
+  if (in_place) {
+    std::fprintf(stderr, "\r%.*s", static_cast<int>(text.size()), text.data());
+    g_progress_active = true;
+  } else {
+    std::fprintf(stderr, "%.*s\n", static_cast<int>(text.size()), text.data());
+    g_progress_active = false;
+  }
   std::fflush(stderr);
-  g_progress_active = true;
+}
+
+bool progress_stderr_is_tty() {
+  static const bool tty = ::isatty(::fileno(stderr)) != 0;
+  return tty;
 }
 
 }  // namespace prp

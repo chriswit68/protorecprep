@@ -28,6 +28,13 @@ struct SendOptions {
 
 enum class ReplayDirection { In, Out, Both };
 
+// How replay reports per-file progress on stderr.
+//   Auto   - in-place line on a terminal, plain log lines otherwise
+//   Line   - one newline-terminated line per update (container/CI friendly)
+//   Inline - always refresh a single in-place line with '\r'
+//   Off    - no progress output at all
+enum class ProgressMode { Auto, Line, Inline, Off };
+
 struct Options {
   std::string command;  // "record", "replay", "passthrough" or "inspect"
 
@@ -91,6 +98,8 @@ struct Options {
   ReplayDirection replay_direction = ReplayDirection::In;
   std::chrono::milliseconds max_gap{0};
   bool strict = false;
+  ProgressMode progress = ProgressMode::Auto;
+  bool progress_set = false;
 
   // passthrough
   size_t forward_queue = 16ull * 1024 * 1024;  // per-stream backlog before reads pause

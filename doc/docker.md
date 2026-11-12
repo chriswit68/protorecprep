@@ -91,10 +91,24 @@ docker compose run --rm protorecprep \
 Alternativ kann das Kommando dauerhaft in `compose.yaml` geändert werden
 (`command:`).
 
-Während des Replays aktualisiert die App eine Zeile auf `stderr`, die den
-aktuellen Capture-Pfad und den Fortschritt in Prozent der jeweiligen
-Dateigröße zeigt (bei `--dir` mit `[i/N]`-Präfix). `docker compose run`
-reicht `stderr` durch; mit `-T` bleibt die Ausgabe ebenfalls sichtbar.
+Während des Replays meldet die App den Fortschritt auf `stderr`. `docker
+compose up` und `docker compose logs` geben nur vollständige Zeilen aus;
+deshalb schreibt der Replay ohne Terminal – der Normalfall im Container –
+vollständige Fortschrittszeilen (höchstens eine pro Sekunde), bei `--dir` mit
+`[i/N]`-Präfix:
+
+```text
+protorecprep-1  | [1/3] /data/recordings/session-.../capture-000001.pcr  37%
+```
+
+Mit `--progress line` lässt sich die zeilenweise Ausgabe erzwingen, mit
+`--progress inline` die In-Place-Zeile, mit `--progress off` die Ausgabe
+abschalten.
+
+Wichtig: `docker compose up`/`run` bauen das Image nicht automatisch neu.
+Nach Code-Änderungen einmalig `docker compose build` ausführen (oder
+`docker compose run --build ...` verwenden), sonst läuft weiterhin das alte
+Binary aus dem Image.
 
 ## Typed-Header-Protokoll (8 Byte)
 

@@ -8,6 +8,7 @@ capture tails and direction filtering.
 """
 
 import os
+import re
 import shutil
 import signal
 import socket
@@ -227,11 +228,14 @@ def record_capture_multi(
         _finish_recorder(proc, stderr_file, stderr_path)
 
 
-def run_replay(binary: str, args: list[str], timeout: float = 30.0) -> subprocess.CompletedProcess:
+def run_replay(
+    binary: str, args: list[str], timeout: float = 30.0, raw: bool = False
+) -> subprocess.CompletedProcess:
+    """Runs a replay; `raw` keeps stderr as bytes so '\r' is not normalised."""
     return subprocess.run(
         [binary, "replay", *args],
         capture_output=True,
-        text=True,
+        text=not raw,
         timeout=timeout,
     )
 
@@ -244,12 +248,30 @@ def capture_files(directory: str) -> list[str]:
     )
 
 
-def replay_to_sink(binary: str, source_args: list[str], extra_args: list[str]) -> tuple[bytes, subprocess.CompletedProcess, int]:
+def progress_lines(stderr: str) -> list[str]:
+    """Returns newline-delimited progress lines.
+
+    Splitting on '\\n' only (not str.splitlines) is deliberate: it verifies that
+    non-TTY progress output is emitted as complete log lines instead of bare
+    '\\r' updates, which line-oriented log consumers such as Docker Compose
+    never display until the line is terminated.
+    """
+    return [
+        line
+        for line in stderr.split("\n")
+        if re.fullmatch(r"(\[\d+/\d+\] )?\S+\.pcr\s+\d+%", line)
+    ]
+
+
+def replay_to_sink(
+    binary: str, source_args: list[str], extra_args: list[str], raw: bool = False
+) -> tuple[bytes, subprocess.CompletedProcess, int]:
     sink = SinkServer()
     try:
         result = run_replay(
             binary,
             [*source_args, "--target", f"127.0.0.1:{sink.port}", *extra_args],
+            raw=raw,
         )
         # Give the sink a moment to drain the final bytes.
         time.sleep(0.1)
@@ -267,13 +289,43 @@ def test_single_file(binary: str, workdir: str) -> None:
 
     expected = b"".join(payloads)
     received, result, connections = replay_to_sink(
-        binary, ["--rec", files[0]], ["--speed", "0", "--direction", "in", "--log-level", "warn"]
+        binary,
+        ["--rec", files[0]],
+        ["--speed", "0", "--direction", "in", "--log-level", "warn"],
+        raw=True,
     )
-    check(result.returncode == 0, f"replay failed: {result.stderr}")
+    stderr = result.stderr.decode("utf-8", "replace")
+    check(result.returncode == 0, f"replay failed: {stderr}")
     check(connections == 1, f"expected one replay connection, got {connections}")
     check(received == expected, f"byte mismatch: got {len(received)}, expected {len(expected)}")
-    check(files[0] in result.stderr, f"progress line missing capture path: {result.stderr!r}")
-    check("100%" in result.stderr, f"progress did not reach 100%: {result.stderr!r}")
+    # stderr is a pipe here, so the default (auto) mode must emit plain lines.
+    check("\r" not in stderr, f"non-TTY progress used carriage returns: {stderr!r}")
+    lines = progress_lines(stderr)
+    check(len(lines) >= 2, f"expected separate progress lines: {stderr!r}")
+    check(files[0] in lines[-1], f"progress line missing capture path: {stderr!r}")
+    check(lines[-1].endswith("100%"), f"progress did not reach 100%: {stderr!r}")
+
+    # --progress off suppresses the progress output entirely.
+    _, off_result, _ = replay_to_sink(
+        binary,
+        ["--rec", files[0]],
+        ["--speed", "0", "--direction", "in", "--log-level", "warn", "--progress", "off"],
+        raw=True,
+    )
+    off_stderr = off_result.stderr.decode("utf-8", "replace")
+    check(off_result.returncode == 0, f"--progress off replay failed: {off_stderr}")
+    check(files[0] not in off_stderr, f"--progress off still printed the path: {off_stderr!r}")
+
+    # --progress inline forces the single in-place line even without a TTY.
+    _, inline_result, _ = replay_to_sink(
+        binary,
+        ["--rec", files[0]],
+        ["--speed", "0", "--direction", "in", "--log-level", "warn", "--progress", "inline"],
+        raw=True,
+    )
+    inline_stderr = inline_result.stderr.decode("utf-8", "replace")
+    check(inline_result.returncode == 0, f"--progress inline replay failed: {inline_stderr}")
+    check("\r" in inline_stderr, f"inline progress missing carriage return: {inline_stderr!r}")
 
 
 def test_multi_chunk(binary: str, workdir: str) -> None:
@@ -285,16 +337,68 @@ def test_multi_chunk(binary: str, workdir: str) -> None:
 
     expected = b"".join(payload for payload, _ in steps)
     received, result, connections = replay_to_sink(
-        binary, ["--dir", out_dir], ["--speed", "0", "--direction", "in", "--log-level", "warn"]
+        binary,
+        ["--dir", out_dir],
+        ["--speed", "0", "--direction", "in", "--log-level", "warn"],
+        raw=True,
     )
-    check(result.returncode == 0, f"replay failed: {result.stderr}")
+    stderr = result.stderr.decode("utf-8", "replace")
+    check(result.returncode == 0, f"replay failed: {stderr}")
     check(connections == 1, f"stream was split across {connections} connections")
     check(received == expected, f"multi-chunk byte mismatch: got {len(received)}, expected {len(expected)}")
-    check(all(path in result.stderr for path in files), f"progress lines missing files: {result.stderr!r}")
+    check(all(path in stderr for path in files), f"progress lines missing files: {stderr!r}")
     check(
-        f"[1/{len(files)}]" in result.stderr and f"[{len(files)}/{len(files)}]" in result.stderr,
-        f"multi-file progress prefix missing: {result.stderr!r}",
+        f"[1/{len(files)}]" in stderr and f"[{len(files)}/{len(files)}]" in stderr,
+        f"multi-file progress prefix missing: {stderr!r}",
     )
+    lines = progress_lines(stderr)
+    check("\r" not in stderr, f"non-TTY progress used carriage returns: {stderr!r}")
+    check(
+        any(line.startswith(f"[1/{len(files)}] ") for line in lines),
+        f"first chunk progress prefix missing: {stderr!r}",
+    )
+    check(
+        any(line.startswith(f"[{len(files)}/{len(files)}] ") for line in lines),
+        f"last chunk progress prefix missing: {stderr!r}",
+    )
+    check(len(lines) >= 2 * len(files), f"expected start/end lines per chunk: {stderr!r}")
+
+
+def test_multi_chunk_pacing(binary: str, workdir: str) -> None:
+    """Paced replays across chunk boundaries must not invent huge gaps."""
+    out_dir = os.path.join(workdir, "chunk-pacing")
+    steps = [(b"alpha-" * 40, 0.3), (b"beta-" * 40, 0.3), (b"gamma-" * 40, 0.0)]
+    record_capture(binary, out_dir, pick_port(), steps, chunk_interval="200ms")
+    files = capture_files(out_dir)
+    check(len(files) >= 2, f"expected multiple capture chunks, got {files}")
+
+    expected = b"".join(payload for payload, _ in steps)
+    sink = SinkServer()
+    start = time.monotonic()
+    try:
+        try:
+            result = run_replay(
+                binary,
+                [
+                    "--dir", out_dir,
+                    "--target", f"127.0.0.1:{sink.port}",
+                    "--speed", "1",
+                    "--direction", "in",
+                    "--log-level", "warn",
+                ],
+                timeout=10.0,
+            )
+        except subprocess.TimeoutExpired as exc:  # noqa: TRY302
+            raise AssertionError(f"paced multi-chunk replay stalled: {exc}") from exc
+        time.sleep(0.1)
+        received = sink.data()
+    finally:
+        sink.close()
+    elapsed = time.monotonic() - start
+
+    check(result.returncode == 0, f"paced multi-chunk replay failed: {result.stderr}")
+    check(received == expected, f"paced multi-chunk byte mismatch: got {len(received)}, expected {len(expected)}")
+    check(elapsed < 8.0, f"paced multi-chunk replay was far too slow: {elapsed:.2f}s")
 
 
 def test_multi_stream(binary: str, workdir: str) -> None:
@@ -477,6 +581,7 @@ def main() -> int:
     try:
         test_single_file(binary, workdir)
         test_multi_chunk(binary, workdir)
+        test_multi_chunk_pacing(binary, workdir)
         test_multi_stream(binary, workdir)
         test_pacing(binary, workdir)
         test_unreachable_target(binary, workdir)
