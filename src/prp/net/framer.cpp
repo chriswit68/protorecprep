@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
-#include "prp/util/bytes.h"
+#include "prp/lib.h"
 
 namespace prp {
 

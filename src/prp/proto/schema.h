@@ -9,7 +9,7 @@
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/message.h>
 
-#include "prp/util/sha256.h"
+#include "prp/lib.h"
 
 namespace prp {
 

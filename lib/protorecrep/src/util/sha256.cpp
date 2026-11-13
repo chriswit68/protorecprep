@@ -1,9 +1,9 @@
-#include "prp/util/sha256.h"
+#include "protorecrep/util/sha256.h"
 
 #include <algorithm>
 #include <cstring>
 
-namespace prp {
+namespace protorecrep {
 namespace {
 
 constexpr uint32_t kInit[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
@@ -134,4 +134,4 @@ std::string Sha256::hex(const Sha256Digest& digest) {
 
 std::string Sha256::hex_of(std::string_view data) { return hex(digest(data)); }
 
-}  // namespace prp
+}  // namespace protorecrep

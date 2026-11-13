@@ -4,6 +4,15 @@ Das Image enthält die Anwendung und alle benötigten Laufzeitbibliotheken
 (Protobuf, Protoc, Abseil). Auf dem Host ist nur Docker mit Compose
 erforderlich. Gestartet wird standardmäßig der `record`-Modus auf Port 5000.
 
+Der Capture-Kern `protorecrep` wird als statische Bibliothek in das Binary
+gelinkt; das Image enthält daher keine separate `libprotorecrep`-Datei. Die
+Bibliothek wird beim normalen App-Build automatisch als Unterprojekt
+mitgebaut.
+
+> **Hinweis:** Dieses Projekt ist ein Vibe-Coding-Experiment. Siehe die
+> entsprechenden Hinweise in der [`README.md`](../README.md) und im
+> [Software-Design-Dokument](software-design.md).
+
 ## Voraussetzungen
 
 - Docker Engine oder Docker Desktop mit Compose v2
@@ -270,6 +279,10 @@ Der Runtime-Stage kopiert `/opt/prp/lib/*.so*` aus dem Builder nach
 werden nur `libstdc++6`, `libgcc-s1` und `libatomic1` installiert. Weitere
 Systembibliotheken bringt das Ubuntu-Basisimage mit.
 
+Die Capture-Bibliothek `protorecrep` ist statisch gelinkt und taucht deshalb
+nicht in `ldd` auf. Dynamisch sind nur Protobuf/Abseil und die
+C++-Laufzeit.
+
 Falls `ldd` eine fehlende Bibliothek meldet, fehlt sie entweder im
 `COPY --from=deps`-Schritt oder muss als Runtime-Paket ergänzt werden.
 
@@ -319,8 +332,8 @@ docker compose build
 ```
 
 Abseil und Protobuf müssen zueinander passen (Protobuf 36.2 erwartet
-Abseil 20250512.1). Beide werden mit C++17 gebaut; die Anwendung selbst
-verwendet C++20.
+Abseil 20250512.1). Beide werden mit C++17 gebaut; die Anwendung und die
+Capture-Bibliothek `protorecrep` verwenden C++20.
 
 ## Weiterführende Dokumentation
 

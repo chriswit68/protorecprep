@@ -1,12 +1,12 @@
-#include "prp/record/format.h"
+#include "protorecrep/format.h"
 
 #include <cstdio>
 #include <cstring>
 
-#include "prp/util/bytes.h"
-#include "prp/util/crc32c.h"
+#include "protorecrep/util/bytes.h"
+#include "protorecrep/util/crc32c.h"
 
-namespace prp::rec {
+namespace protorecrep::rec {
 namespace {
 
 constexpr size_t kDataFixed = 16;     // stream_id + dir + pad + ts
@@ -240,4 +240,4 @@ bool parse_stream_close(const uint8_t* payload, size_t len, StreamCloseInfo& out
   return true;
 }
 
-}  // namespace prp::rec
+}  // namespace protorecrep::rec

@@ -6,24 +6,17 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "prp/cli/options.h"
-#include "prp/core/capture_item.h"
-#include "prp/core/item_queue.h"
 #include "prp/json/json_writer.h"
+#include "prp/lib.h"
 #include "prp/net/framer.h"
 #include "prp/proto/schema.h"
-#include "prp/record/format.h"
-#include "prp/record/reader.h"
-#include "prp/record/recorder.h"
 #include "prp/util/base64.h"
-#include "prp/util/bytes.h"
-#include "prp/util/crc32c.h"
-#include "prp/util/fs.h"
-#include "prp/util/sha256.h"
-#include "prp/util/text.h"
 
 namespace {
 
@@ -961,6 +954,52 @@ void test_recorder_roundtrip() {
   std::filesystem::remove_all(dir);
 }
 
+struct CapturingLogger final : prp::ILogger {
+  std::mutex mutex;
+  std::vector<std::pair<prp::LogLevel, std::string>> messages;
+
+  bool enabled(prp::LogLevel) const override { return true; }
+  void log(prp::LogLevel level, std::string_view message) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    messages.emplace_back(level, std::string(message));
+  }
+};
+
+void test_recorder_logger() {
+  const auto dir = make_temp_dir("recorder-logger");
+  prp::RecorderConfig config;
+  config.out_dir = dir;
+  config.session_id = prp::random_hex(16);
+  config.fsync_interval = std::chrono::milliseconds(0);
+  config.write_summary = false;
+
+  CapturingLogger logger;
+  std::string err;
+  {
+    prp::Recorder recorder(config, &logger);
+    CHECK(recorder.start(err));
+    recorder.submit(prp::make_data(1, prp::Direction::In, prp::now_wall_ns(),
+                                   std::vector<uint8_t>{0x01, 0x02}));
+    recorder.stop();
+    CHECK(!recorder.stats().failed);
+  }
+
+  // The library must report through the supplied logger instead of writing to
+  // stderr itself, and write_summary=false must leave summary.json to the app.
+  std::lock_guard<std::mutex> lock(logger.mutex);
+  bool saw_start = false;
+  bool saw_stop = false;
+  for (const auto& [level, message] : logger.messages) {
+    if (level != prp::LogLevel::Info) continue;
+    if (message.find("recorder started") != std::string::npos) saw_start = true;
+    if (message.find("recorder stopped") != std::string::npos) saw_stop = true;
+  }
+  CHECK(saw_start);
+  CHECK(saw_stop);
+  CHECK(!std::filesystem::exists(dir / "summary.json"));
+  std::filesystem::remove_all(dir);
+}
+
 void test_capture_reader() {
   const auto dir = make_temp_dir("capture-reader");
   prp::RecorderConfig config;
@@ -1461,6 +1500,7 @@ int main(int argc, char** argv) {
   test_item_queue();
   test_file_header();
   test_recorder_roundtrip();
+  test_recorder_logger();
   test_capture_reader();
   test_truncation_recovery();
   test_json_escape();

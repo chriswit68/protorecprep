@@ -4,17 +4,30 @@
 |------|------|
 | Projekt | `protorecprep` |
 | Dokumenttyp | Software-Design-Dokument nach arc42 |
-| Version | 1.0 |
-| Stand | 10. November 2026 |
-| Git-Stand | `ce84dde` (plus lokale Dokumentation) |
+| Version | 1.1 |
+| Stand | 13. November 2026 |
+| Git-Stand | `25490b5` (plus lokale Änderungen am Bibliotheks-Refactoring) |
 | Zielgruppe | Entwickler, Betreiber, Integratoren |
 | Sprache | Deutsch |
+
+> **Hinweis: Vibe-Coding-Experiment**
+>
+> Dieses Projekt ist ein **Vibe-Coding-Experiment**. Code und Dokumentation
+> sind überwiegend im Dialog mit KI-Assistenten entstanden. Das Design ist
+> explorativ und als Prototyp zu verstehen, nicht als produktionsgehärtete
+> Architektur. Vor einem Einsatz in kritischen Umgebungen sind Code, Tests,
+> Sicherheitsannahmen und dieses Dokument unabhängig zu prüfen.
 
 Dieses Dokument beschreibt die Architektur von `protorecprep`. Es folgt der
 Kapitelstruktur von arc42 und ergänzt die benutzerorientierte
 [`README.md`](../README.md) sowie die Docker-Hinweise in
 [`docker.md`](docker.md). Alle Aussagen beziehen sich auf den oben genannten
 Code-Stand.
+
+Seit Version 1.1 ist der speichernde und lesende Kern als eigenständige
+C++-Bibliothek `protorecrep` unter `lib/protorecrep/` abgetrennt. Die
+Anwendung `protorecprep` bindet sie ein und behält Netzwerk-, Protobuf-,
+JSON- und CLI-Logik.
 
 ## Inhaltsverzeichnis
 
@@ -49,13 +62,18 @@ maßgebliche Wahrheit.** Sie muss auch dann vollständig und replizierbar sein,
 wenn das JSON-Sidecar Fehler macht, Frames unbekannt sind oder der
 Anwendungsprozess abstürzt.
 
+Der Capture-Kern ist als statische Bibliothek `protorecrep` gekapselt. Sie
+schreibt und liest `.pcr`-Dateien, stellt Queue- und Integritätsprimitive
+bereit und ist ohne Netzwerk-, Protobuf- oder CLI-Abhängigkeit nutzbar. Die
+Anwendung `protorecprep` ist ein Konsument dieser Bibliothek.
+
 ### 1.2 Funktionale Anforderungen
 
 | ID | Anforderung | Ausprägung im System |
 |----|-------------|----------------------|
 | FR-01 | TCP-Server mit mehreren parallelen Verbindungen | `Server`, `Session`, Boost.Asio mit Session-Strands |
 | FR-02 | Verlustfreie Binäraufnahme inkl. Wire-Framing | `Recorder`, `CaptureItem`, `.pcr`-Format |
-| FR-03 | Drei Framings: `varint-length`, `raw`, `typed-length-le` | `rec::Framing`, `FrameValidator`, `FrameReader` |
+| FR-03 | Drei Framings: `varint-length`, `raw`, `typed-length-le` | `protorecrep::rec::Framing`, `FrameValidator`, `FrameReader` |
 | FR-04 | 8-Byte-Header: 4 Byte Typ-ID LE + 4 Byte Länge LE | `kTypedHeaderSize`, `frame_typed_message()` |
 | FR-05 | Typzuordnung ausschließlich über `type_map` | CLI/INI-Parser, `resolve_type_map()` |
 | FR-06 | Unbekannte Typ-IDs ohne Verbindungsabbruch erfassen | `JsonWriter::handle_data()` → `unparsed` mit `type_id` |
@@ -69,6 +87,8 @@ Anwendungsprozess abstürzt.
 | FR-14 | Betrieb im Container ohne Host-Abhängigkeiten | `Dockerfile`, `compose.yaml`, `etc/docker.ini` |
 | FR-15 | Schema-Validierung beim Replay | SHA-256 im Datei-Header, `ReplayRunner::validate_schema()` |
 | FR-16 | Optionale Kopplung von Client- und Zielverbindung im Passthrough | `--link-connections`, `CloseReason::ForwardError` |
+| FR-17 | Capture-Speicherung und -Lesen als eigenständige Bibliothek | `lib/protorecrep/`, Namespace `protorecrep`, statisches Target `protorecrep::protorecrep` |
+| FR-18 | Bibliotheksausgaben über die Log-Schnittstelle des Einbetters | `ILogger`, `AppLogger`, `nullptr` = stille Ausgabe |
 
 ### 1.3 Qualitätsziele
 
@@ -107,6 +127,9 @@ Anwendungsprozess abstürzt.
 | TB-06 | Dateisystem als einziger Persistenzspeicher | Keine Datenbank, kein externer Broker |
 | TB-07 | Protokoll ist wire-kompatibel festgelegt | Keine Heuristik, keine automatische Typ-Erkennung |
 | TB-08 | Container-Host hat nur Docker + Compose | Protobuf, Protoc und Abseil müssen im Image liegen |
+| TB-09 | Capture-Bibliothek ohne Netzwerk, Boost.Asio und Protobuf | `lib/protorecrep/` ist auch ohne die App und ohne deren Abhängigkeiten baubar |
+| TB-10 | Statische Bibliothek mit CMake-Export | Nutzung per `add_subdirectory` oder `find_package(protorecrep CONFIG REQUIRED)` |
+| TB-11 | Bibliothek schreibt nie direkt auf stdout/stderr | Ausgabe ausschließlich über `ILogger`; `nullptr` unterdrückt sie |
 
 ### 2.2 Organisatorische Randbedingungen
 
@@ -165,6 +188,7 @@ Binäraufnahme bleibt protokolltransparent.
 | Dateisystem | Dateien/Verzeichnisse | Ein-/Ausgabe | Captures, JSONL, Blobs, Meta-/Summary-Dateien |
 | Docker Engine | Container, Ports, Volumes | Betrieb | Image enthält App und Laufzeitbibliotheken |
 | Betriebssystem | Signale, Timer, Sockets | Laufzeit | `SIGINT`/`SIGTERM` lösen sauberes Shutdown aus |
+| Einbettende Anwendung | C++-API, CMake-Target | Ein-/Ausgabe | Nutzt `protorecrep` zum Schreiben/Lesen von Captures und liefert einen `ILogger` |
 
 ### 3.3 Externe Schnittstellen im Detail
 
@@ -213,18 +237,19 @@ Siehe Abschnitt [8.5](#85-persistenz-und-datenintegrität) und
 
 ```mermaid
 flowchart TB
-  subgraph entry["Einstieg"]
+  subgraph entry["Einstieg (App)"]
     MAIN["main.cpp"]
     CLI["Options / INI-Parser"]
   end
 
-  subgraph app["Anwendungslogik"]
+  subgraph app["Anwendung protorecprep (prp)"]
+    ALIAS["src/prp/lib.h (Aliase)"]
     RECAPP["record_app"]
     REPLAY["ReplayRunner"]
-    INSPECT["inspect / recovery"]
+    INSPECT["inspect-Formatierung"]
   end
 
-  subgraph net["Netzwerk"]
+  subgraph net["Netzwerk (App)"]
     SERVER["Server"]
     SESSION["Session (pro Verbindung)"]
     FWD["SessionForwarder"]
@@ -232,14 +257,16 @@ flowchart TB
     FRAMER["FrameValidator / FrameReader"]
   end
 
-  subgraph capture["Aufzeichnung"]
+  subgraph lib["Bibliothek protorecrep"]
+    CAPITEM["CaptureItem"]
+    QUEUE["BoundedQueue / BoundedItemQueue"]
     REC["Recorder"]
-    QUEUE["BoundedItemQueue"]
     FORMAT["PCRP-Format"]
-    READER["CaptureReader"]
+    READER["CaptureReader / Scan"]
+    LOGGER["ILogger (Schnittstelle)"]
   end
 
-  subgraph sidecar["Sidecar"]
+  subgraph sidecar["Sidecar (App)"]
     JSON["JsonWriter"]
     SCHEMA["Schema"]
   end
@@ -249,19 +276,23 @@ flowchart TB
   CLI --> REPLAY
   CLI --> INSPECT
   RECAPP --> SERVER
-  RECAPP --> REC
+  RECAPP -->|"RecorderConfig + AppLogger"| REC
   RECAPP --> JSON
   SERVER --> SESSION
   SESSION --> FRAMER
   SESSION --> FWD
-  SESSION --> QUEUE
+  SESSION -->|"CaptureItem"| QUEUE
   QUEUE --> REC
   REC --> FORMAT
   REC -->|"ItemObserver (Segment)"| JSON
+  REC -.-> LOGGER
+  READER -.-> LOGGER
   JSON --> SCHEMA
   FWD --> CLIENT
   REPLAY --> READER
   REPLAY --> CLIENT
+  ALIAS -.->|"Typ-Aliase"| REC
+  ALIAS -.->|"Typ-Aliase"| READER
 ```
 
 ### 4.2 Zentrale Strategien
@@ -279,8 +310,9 @@ flowchart TB
 | S9 | **Zeitgetreues Replay mit Rückstau-Schutz** | Echtzeitverhalten testen, ohne Bursts zu erzeugen | Monotone Timeline, `--speed`, `--max-gap`, High-Water-Marks |
 | S10 | **Forwarding ist optional und isoliert** | Passthrough darf Aufzeichnung nie gefährden | `SessionForwarder` mit eigenen Fehler-Callbacks; Source-Stream bleibt offen |
 | S11 | **JSON-Chunks folgen den Capture-Chunks** | Ohne gemeinsame Grenzen ist die Zuordnung nur über Zeitstempel möglich | Recorder meldet Item + Segmentindex per Observer; Dateinamen teilen den Stamm |
-| S11 | **Konfiguration vor Laufzeit prüfen** | Fehler früh und klar melden | `validate_options()` vor dem Start; Exit-Code 2 |
-| S12 | **Betrieb als einzelnes Binary** | Einfacher Transport und Containerbetrieb | Keine externen Dienste; nur Dateisystem und TCP |
+| S12 | **Konfiguration vor Laufzeit prüfen** | Fehler früh und klar melden | `validate_options()` vor dem Start; Exit-Code 2 |
+| S13 | **Betrieb als einzelnes Binary** | Einfacher Transport und Containerbetrieb | Keine externen Dienste; nur Dateisystem und TCP |
+| S14 | **Capture-Kern als eigenständige Bibliothek** | Speicher-/Leselogik unabhängig von Netzwerk und Protobuf wiederverwenden | `lib/protorecrep/`, Namespace `protorecrep`, statisches Target mit CMake-Export |
 
 ### 4.3 Technologieentscheidungen im Überblick
 
@@ -292,6 +324,11 @@ flowchart TB
 - **SHA-256** für den Schema-Digest, **CRC32C** für Datensatzintegrität.
 - **Eigenes JSONL** statt eingebetteter Datenbank, damit Aufzeichnungen mit
   Standardwerkzeugen lesbar bleiben.
+- **Eigenständige statische C++20-Bibliothek** `protorecrep` für den
+  Capture-Kern; nur Threads und POSIX/`std::filesystem`, kein Boost und kein
+  Protobuf.
+- **`ILogger`-Schnittstelle** statt eigener Ausgabesenke: Die App liefert ihre
+  bestehende Log- und Fortschrittsausgabe an die Bibliothek durch.
 - **Docker Multi-Stage-Build**: Abseil und Protobuf werden aus gepinnten
   Quellen gebaut; das Laufzeit-Image enthält nur die nötigen Bibliotheken.
 
@@ -304,18 +341,21 @@ flowchart TB
 | Baustein | Verantwortung | Quellorte |
 |----------|---------------|-----------|
 | Einstieg/CLI | Argumente, INI, Hilfe, Validierung, Dispatch | `src/main.cpp`, `src/prp/cli/` |
-| Anwendungssteuerung | Start-/Shutdown-Reihenfolge, Metadaten, Summary, Inspect | `src/prp/app/record_app.cpp` |
+| Anwendungssteuerung | Start-/Shutdown-Reihenfolge, Metadaten, Summaries, Inspect | `src/prp/app/record_app.cpp` |
 | Netzwerk-Server | Accept, Verbindungslimit, Session-Lebenszyklus | `src/prp/net/server.cpp`, `server.h` |
 | Framer | Inkrementelle Validierung und Reassembly | `src/prp/net/framer.cpp`, `framer.h` |
-| Recorder | Persistenz, CRC, Rotation, fsync, Statistik | `src/prp/record/recorder.cpp`, `recorder.h` |
-| Capture-Format | Header-/Record-Kodierung und -Dekodierung | `src/prp/record/format.cpp`, `format.h` |
-| Capture-Reader | Sequenzielles Lesen, Scan, Recovery | `src/prp/record/reader.cpp`, `reader.h` |
+| Bibliotheks-API | Öffentliche Capture-Typen, Konfiguration, `ILogger`, Umbrella-Header | `lib/protorecrep/include/protorecrep/` |
+| Recorder | Persistenz, CRC, Rotation, fsync, Statistik, `summary.json` | `lib/protorecrep/src/recorder.cpp`, `include/protorecrep/recorder.h` |
+| Capture-Format | Header-/Record-Kodierung und -Dekodierung | `lib/protorecrep/src/format.cpp`, `include/protorecrep/format.h` |
+| Capture-Reader | Sequenzielles Lesen, Scan, Recovery | `lib/protorecrep/src/reader.cpp`, `include/protorecrep/reader.h` |
+| Library-Core | Items, Richtungen, Close-Gründe, bounded Queue | `lib/protorecrep/include/protorecrep/capture_item.h`, `queue.h` |
 | JSON-Sidecar | Dekodierung, Blob-Extraktion, JSONL-Chunks je Capture-Chunk | `src/prp/json/json_writer.cpp`, `json_writer.h` |
 | Schema | `.proto` laden, Descriptor-Set, Digest | `src/prp/proto/schema.cpp`, `schema.h` |
-| Core | Items, Richtungen, Close-Gründe, Queue | `src/prp/core/` |
 | Forwarding/Client | Asynchroner TCP-Client und Weiterleitung | `src/prp/net/client.cpp`, `forwarder.cpp` |
-| Replay | Timeline, Pacing, Reconnect, Validierung | `src/prp/replay/replay_app.cpp` |
-| Utilities | Log, CRC32C, SHA-256, Base64, FS, Text | `src/prp/util/` |
+| Replay | Timeline, Pacing, Reconnect, Validierung, Fortschrittsausgabe | `src/prp/replay/replay_app.cpp` |
+| Utilities (Bibliothek) | CRC32C, SHA-256, Dateisystem-, Byte- und Texthelfer | `lib/protorecrep/src/util/` |
+| Utilities (App) | Logging (`AppLogger`), Base64 | `src/prp/util/` |
+| App-Aliase | Abbildung der `protorecrep`-Typen auf den Namespace `prp` | `src/prp/lib.h` |
 | Deployment | Image, Compose, Beispielkonfigurationen | `Dockerfile`, `compose.yaml`, `etc/` |
 | Tests/Benchmark | Unit-, Integrations-, E2E-Tests, Durchsatz | `tests/`, `bench/` |
 
@@ -348,13 +388,24 @@ Durch diese Reihenfolge bleibt die Aufnahme auch dann korrekt, wenn ein Frame
 fehlerhaft ist. Der Framer entscheidet nur, ob die Verbindung wegen eines
 Protokollfehlers geschlossen wird.
 
-#### 5.2.3 Aufzeichnung
+#### 5.2.3 Aufzeichnung (Bibliothek `protorecrep`)
 
-Der Recorder besitzt einen dedizierten Writer-Thread. Producer übergeben
-`shared_ptr<CaptureItem>` an die Queue; der Writer kodiert Payloads, berechnet
-CRC32C, schreibt in einen Batch und rotiert Segmente. Der Recorder schreibt
-`summary.json` und meldet fatale Schreibfehler über einen Callback an die
-Anwendung, die daraufhin ein sauberes Shutdown einleitet.
+Der Recorder ist Teil der eigenständigen Bibliothek `protorecrep` und besitzt
+einen dedizierten Writer-Thread. Producer übergeben
+`shared_ptr<const CaptureItem>` an die Queue; der Writer kodiert Payloads,
+berechnet CRC32C, schreibt in einen Batch und rotiert Segmente. Der Recorder
+schreibt standardmäßig `summary.json`; die Anwendung kann das über
+`RecorderConfig::write_summary = false` abschalten, wenn sie eigene
+Metadatendateien pflegt. Fatale Schreibfehler meldet er über einen Callback an
+die Anwendung, die daraufhin ein sauberes Shutdown einleitet.
+
+Die Anwendung konstruiert den Recorder mit einer `RecorderConfig` und einem
+optionalen `ILogger*`. Alle Log- und Fortschrittszeilen der Bibliothek laufen
+über diese Schnittstelle; `nullptr` unterdrückt sie vollständig. Die App
+übergibt ihren `AppLogger`, der die bestehenden `prp::log_*`-Funktionen und die
+Fortschrittsausgabe wiederverwendet. Dadurch bleiben Log-Format, Level-Filter
+und Terminalverhalten unverändert. Netzwerk-, JSON- und Schema-Logik sind
+nicht Teil der Bibliothek.
 
 #### 5.2.4 JSON-Sidecar, Chunks und Blobs
 
@@ -410,6 +461,11 @@ aktualisierte Zeile, ohne Terminal vollständige, mit `\n` abgeschlossene
 Logzeilen (höchstens eine pro Sekunde), weil Docker-Compose und andere
 Log-Pipelines nur an `\n` trennen.
 
+Die Bibliothek stellt dafür nur `CaptureReader` mit `bytes_consumed()` und
+`file_size()` sowie die Scan-/Recovery-Funktionen bereit. Timeline, Pacing,
+Reconnect, Fortschrittsformatierung und Netzwerk bleiben in
+`src/prp/replay/`.
+
 ### 5.3 Klassenbeschreibungen
 
 #### `Options` (`prp::Options`)
@@ -457,28 +513,46 @@ Log-Pipelines nur an `\n` trennen.
   gestartet; lokal erzeugte Send-Nachrichten werden nicht weitergeleitet.
 - **Threading:** Alle Operationen werden über den Session-Strand serialisiert.
 
-#### `Recorder` (`prp::Recorder`)
+#### `Recorder` (`protorecrep::Recorder`, in der App als `prp::Recorder`)
 
 - **Verantwortung:** Dauerhafte, CRC-gesicherte Binäraufnahme.
 - **Zustand:** `RecorderConfig`, `BoundedItemQueue`, Writer-Thread, Datei-
   deskriptor, Segmentindex/-größe, Batch-Puffer, aktive Streams, Statistiken,
-  Fehlerzustand, optionaler `ItemObserver`.
+  Fehlerzustand, optionaler `ItemObserver`, geborgter `ILogger*`.
 - **Wichtige Methoden:** `start()`, `stop()`, `submit()`, `set_item_observer()`,
-  `run()`, `open_segment()`, `close_segment()`, `append_record()`,
-  `maybe_rotate()`, `ensure_synced()`, `write_summary()`, `fail()`.
+  `set_fatal_callback()`, `run()`, `open_segment()`, `close_segment()`,
+  `append_record()`, `maybe_rotate()`, `ensure_synced()`, `write_summary()`,
+  `fail()`.
 - **Invarianten:** Pro Segment genau ein Header; der Trailer wird nur bei
   sauberem Abschluss geschrieben; CRC32C wird über den Payload berechnet;
   ein Segment wird erst nach `fsync` geschlossen; ein Schreibfehler wird
   einmalig als fatal gemeldet. Der Observer sieht jedes erfolgreich
   geschriebene Item genau einmal mit dem Segment, in dem es liegt.
+  `summary.json` wird nur bei `write_summary == true` geschrieben; der Logger
+  wird nie besessen und darf `nullptr` sein.
 - **Threading:** Nur der Writer-Thread führt Datei-I/O aus. `submit()` ist
-  MPSC-sicher.
+  MPSC-sicher. Log-Aufrufe erfolgen aus dem jeweiligen Aufrufer-Thread; der
+  `ILogger` muss thread-sicher sein.
 
-#### `BoundedQueue<T>` / `BoundedItemQueue` (`prp::BoundedQueue`, `prp::BoundedItemQueue`)
+#### `ILogger` (`protorecrep::ILogger`)
+
+- **Verantwortung:** Nicht-besitzende Ausgabesenke für Logzeilen und
+  Fortschrittsmeldungen der Bibliothek.
+- **Methoden:** `enabled(LogLevel)`, `log(LogLevel, message)`,
+  `progress_is_tty()`, `progress(text, in_place)`, `clear_progress()`.
+- **Invarianten:** Die Bibliothek schreibt nie selbst auf `stdout`/`stderr`;
+  ein `nullptr`-Logger unterdrückt sämtliche Ausgaben. `enabled()` erlaubt dem
+  Einbetter, teure Formatierung zu vermeiden.
+- **Umsetzung in der App:** `prp::AppLogger` delegiert an die bestehenden
+  `prp::log_*`-Funktionen und die Fortschrittsausgabe; die App übergibt
+  `&app_logger()` an den Recorder.
+
+#### `BoundedQueue<T>` / `BoundedItemQueue` (`protorecrep::BoundedQueue`, `protorecrep::BoundedItemQueue`)
 
 - **Verantwortung:** Speicherbegrenzte MPSC-Queue mit einstellbarer
-  Überlaufpolitik. `BoundedItemQueue` ist der Alias für `CaptureItem`; der
+  Überlaufpolitik. `BoundedItemQueue` ist der Alias für `ItemPtr`; der
   JsonWriter verwendet `BoundedQueue<JsonQueueItem>` mit Segmentindex.
+  Die Queue ist Teil der Capture-Bibliothek; `JsonQueueItem` bleibt app-seitig.
 - **Zustand:** `std::deque<T>`, Mutex, zwei Condition Variables,
   Byte-Buchhaltung, Statistiken; die Buchhaltung kommt aus
   `QueueItemTraits<T>` (`accounted_bytes()`, `empty()`).
@@ -490,7 +564,7 @@ Log-Pipelines nur an `\n` trennen.
   leerer Queue aufgenommen (kein Deadlock).
 - **Threading:** Vollständig threadsicher.
 
-#### `CaptureItem` (`prp::CaptureItem`)
+#### `CaptureItem` (`protorecrep::CaptureItem`, in der App als `prp::CaptureItem`)
 
 - **Verantwortung:** Unveränderliche Arbeitseinheit zwischen Netzwerk,
   Recorder und JSON-Writer.
@@ -559,10 +633,13 @@ Log-Pipelines nur an `\n` trennen.
 - **Threading:** Gleichzeitiges Lesen ist erlaubt; jeder Thread verwendet eine
   eigene `DynamicMessageFactory`.
 
-#### `CaptureReader` (`prp::CaptureReader`)
+#### `CaptureReader` (`protorecrep::CaptureReader`, in der App als `prp::CaptureReader`)
 
 - **Verantwortung:** Sequenzielles, CRC-validierendes Lesen einer
-  `.pcr`-Datei.
+  `.pcr`-Datei. Header-Prüfung, Scan und Recovery liegen ebenfalls in der
+  Bibliothek (`read_capture_header`, `scan_capture_file`,
+  `recover_session_dir`, `list_capture_files`); die Textausgabe von `inspect`
+  formatiert die App.
 - **Zustand:** `FILE*`, Pfad, Header, Payload-Puffer, Schadensflag,
   Record-Zähler, Dateigröße, bereits konsumierte Bytes.
 - **Wichtige Methoden:** `open()`, `next()`, `close()`, `header()`,
@@ -624,22 +701,32 @@ Log-Pipelines nur an `\n` trennen.
 
 | Typ | Aufgabe |
 |-----|---------|
-| `rec::FileHeader` | Magic, Version, UUID, Framing, Startzeit, Schema-Digest, Descriptor-Set |
-| `rec::Framing` | `Raw`, `VarintLength`, `TypedLengthLE` |
-| `rec::RecordType` | `StreamOpen`, `Data`, `StreamClose`, `Marker`, `Trailer` |
-| `rec::TrailerInfo` | Record-/Byte-Zähler, Clean-Flag, Endzeit |
-| `rec::StreamOpenInfo` / `DataInfo` / `StreamCloseInfo` | Dekodierte Payloads für Replay und Inspect |
-| `SendSpec` | Vorbereitete, bereits geframte Nachricht plus Zeitplan |
-| `ForwardConfig` | Ziel, Timeouts, Retries, Queue-Limit, Reconnect, Verbindungskopplung |
-| `JsonWriterConfig` | Schema, Typ-Map, Blob-Verzeichnis, Chunk-Modus/-Verzeichnis, Inline-Grenze, Formatierung |
-| `ScanStats` | Ergebnis von `inspect`: Header, Zähler, Trailer, Schaden, gültiges Ende |
-| `CaptureRecord` | Ein dekodierter Datensatz für den Replay-Pfad |
+| `protorecrep::rec::FileHeader` | Magic, Version, UUID, Framing, Startzeit, Schema-Digest, Descriptor-Set |
+| `protorecrep::rec::Framing` | `Raw`, `VarintLength`, `TypedLengthLE` |
+| `protorecrep::rec::RecordType` | `StreamOpen`, `Data`, `StreamClose`, `Marker`, `Trailer` |
+| `protorecrep::rec::TrailerInfo` | Record-/Byte-Zähler, Clean-Flag, Endzeit |
+| `protorecrep::rec::StreamOpenInfo` / `DataInfo` / `StreamCloseInfo` | Dekodierte Payloads für Replay und Inspect |
+| `protorecrep::RecorderConfig` | Ausgabeverzeichnis, Framing, Schema-Bezug, Queue-/IO-/Rotationsparameter, `write_summary` |
+| `protorecrep::ScanStats` | Ergebnis von `inspect`: Header, Zähler, Trailer, Schaden, gültiges Ende |
+| `protorecrep::CaptureRecord` | Ein dekodierter Datensatz für den Replay-Pfad |
+| `SendSpec` (App) | Vorbereitete, bereits geframte Nachricht plus Zeitplan |
+| `ForwardConfig` (App) | Ziel, Timeouts, Retries, Queue-Limit, Reconnect, Verbindungskopplung |
+| `JsonWriterConfig` (App) | Schema, Typ-Map, Blob-Verzeichnis, Chunk-Modus/-Verzeichnis, Inline-Grenze, Formatierung |
 
 ### 5.4 Klassendiagramm (Auszug)
 
 ```mermaid
 classDiagram
   class Options
+  class RecorderConfig
+  class ILogger {
+    <<interface>>
+    +enabled(level)
+    +log(level, message)
+    +progress_is_tty()
+    +progress(text, in_place)
+    +clear_progress()
+  }
   class Server {
     +open(err)
     +start()
@@ -654,6 +741,8 @@ classDiagram
     +do_close(reason)
   }
   class Recorder {
+    <<protorecrep>>
+    +Recorder(RecorderConfig, ILogger*)
     +start(err)
     +stop()
     +submit(item)
@@ -661,6 +750,7 @@ classDiagram
     +stats()
   }
   class BoundedItemQueue {
+    <<protorecrep>>
     +push(item)
     +pop()
     +close()
@@ -693,6 +783,7 @@ classDiagram
     +exit_code()
   }
   class CaptureReader {
+    <<protorecrep>>
     +open(path, err)
     +next(record, detail)
     +close()
@@ -713,6 +804,8 @@ classDiagram
 
   Server "1" --> "*" Session : verwaltet
   Server --> Recorder : schreibt
+  Recorder --> RecorderConfig
+  Recorder --> ILogger : nutzt (optional)
   Session --> FrameValidator
   Session --> SessionForwarder : passthrough
   Session --> BoundedItemQueue : submit
@@ -731,7 +824,7 @@ classDiagram
 |-------------|----------------|
 | FR-01 | `Server`, `Session` |
 | FR-02 | `Recorder`, `CaptureItem`, `BoundedItemQueue`, PCRP-Format |
-| FR-03 | `rec::Framing`, `FrameValidator`, `FrameReader` |
+| FR-03 | `protorecrep::rec::Framing`, `FrameValidator`, `FrameReader` |
 | FR-04 | `framer.h` (`kTypedHeaderSize`, `frame_typed_message`) |
 | FR-05 | CLI-Parser, `resolve_type_map`, `JsonWriterConfig` |
 | FR-06 | `JsonWriter::handle_data`, `emit_unparsed` |
@@ -740,10 +833,13 @@ classDiagram
 | FR-09 | `SessionForwarder`, `Session::on_read/on_response` |
 | FR-10 | `Recorder::maybe_rotate`, `ItemObserver`, `JsonWriter::ensure_chunk` |
 | FR-11 | `CaptureReader`, `scan_capture_file`, `run_inspect` |
-| FR-12 | `JsonWriter`, `Schema`, `rec::segment_json_name` |
+| FR-12 | `JsonWriter`, `Schema`, `protorecrep::rec::segment_json_name` |
 | FR-13 | `SendSpec`, `Session::schedule_sends` |
 | FR-14 | `Dockerfile`, `compose.yaml` |
 | FR-15 | `Schema`, `ReplayRunner::validate_schema` |
+| FR-16 | `SessionForwarder`, `--link-connections` |
+| FR-17 | `lib/protorecrep/`, `protorecrep::Recorder`, `protorecrep::CaptureReader`, CMake-Export |
+| FR-18 | `protorecrep::ILogger`, `prp::AppLogger`, `prp::app_logger()` |
 
 ---
 
@@ -760,8 +856,8 @@ flowchart TD
   C2 --> D["Schema laden (optional)"]
   D --> E["Typ-Map auflösen"]
   E --> F["SendSpec vorbereiten (optional)"]
-  F --> G["meta.json schreiben"]
-  G --> H["Recorder.start (Chunk 1)"]
+  F --> G["meta.json schreiben (App)"]
+  G --> H["Recorder.start (Bibliothek, Chunk 1)"]
   H --> I["JsonWriter.start (Chunk 1, optional)"]
   I --> I2["ItemObserver registrieren"]
   I2 --> J["Server.open (bind/listen)"]
@@ -782,8 +878,9 @@ flowchart TD
 
 Wichtige Reihenfolgen:
 
-1. `meta.json` wird geschrieben, **bevor** der Server lauscht.
-2. Der Recorder ist gestartet, bevor die erste Session Daten liefern kann.
+1. `meta.json` wird von der Anwendung geschrieben, **bevor** der Server lauscht.
+2. Der Recorder der Bibliothek ist gestartet, bevor die erste Session Daten
+   liefern kann.
 3. Der JsonWriter öffnet Chunk 1 bereits beim Start; der Recorder kennt den
    Observer, bevor die erste Session Items liefert.
 4. Beim Shutdown werden zuerst keine neuen Verbindungen mehr angenommen,
@@ -833,6 +930,11 @@ erfolgreichen Schreiben meldet er das Item über den `ItemObserver` an den
 JsonWriter, zusammen mit dem Segmentindex, in dem der Record gelandet ist.
 Der Recorder blockiert bei vollem Puffer gemäß `--overflow`; der JsonWriter
 blockiert nie und verwirft bei Überlauf.
+
+Die gestrichelte Bibliotheksgrenze verläuft zwischen `Session`/`JsonWriter` und
+dem Capture-Kern: `CaptureItem`, Queue, Recorder, Format und Reader liegen in
+`protorecrep`; Netzwerk, JSON, Schema und App-Steuerung bleiben in
+`src/prp/`.
 
 ### 6.3 JSON-Chunk-Zuordnung
 
@@ -1200,6 +1302,10 @@ Regeln:
   Writer-Thread auf; der Callback reicht das Item nur in die JSON-Queue.
 - `CaptureItem` ist nach dem Submit unveränderlich.
 - Statistiken sind atomar; Metriken werden ohne Sperren gelesen.
+- Die Bibliothek ruft `ILogger` aus dem Thread auf, in dem das Ereignis
+  entsteht (Recorder-Writer bzw. Aufrufer); die Implementierung muss
+  thread-sicher sein. `AppLogger` delegiert an die ohnehin threadsicheren
+  `prp::log_*`-Funktionen.
 
 ### 8.2 Speicher und Ownership
 
@@ -1298,14 +1404,22 @@ erlaubt.
 
 ### 8.8 Logging und Observability
 
-- Level: `debug`, `info`, `warn`, `error`.
-- Ausgabe auf stderr, damit stdout für `inspect`-Berichte frei bleibt.
+- Level: `debug`, `info`, `warn`, `error` (`protorecrep::LogLevel`, in der App
+  als `prp::LogLevel` aliasiert).
+- Die Bibliothek schreibt ausschließlich über `ILogger`; `nullptr` bedeutet
+  stille Ausführung. Sie öffnet weder `stdout` noch `stderr`.
+- Die App implementiert `AppLogger` und übergibt `&app_logger()` an den
+  Recorder. Ausgabe auf stderr, damit stdout für `inspect`-Berichte frei bleibt.
+- Fortschritt (z. B. beim Lesen) läuft über `progress()`/`clear_progress()`;
+  `progress_is_tty()` steuert In-Place- versus Zeilenausgabe. Die App behält
+  ihre bisherige Formatierung und Drosselung.
 - Zentrale Ereignisse: Start/Ende, Session accepted/closed, Queue-Overflow,
   JSON-Drops, Blob-Schreibfehler, Replay-Statistik.
 - JSONL-Events: `stream_open`, `message`, `unparsed`, `@file`,
   `stream_close`, `marker`; jedes Event enthält `seq` und `segment`.
-- Summary-Dateien: `summary.json`, `json-summary.json` (inkl.
-  `chunks_written`, `chunk_open_errors`, `chunks[]`), `meta.json`.
+- Summary-Dateien: `summary.json` (Bibliothek, abschaltbar über
+  `write_summary = false`), `json-summary.json` (inkl. `chunks_written`,
+  `chunk_open_errors`, `chunks[]`) und `meta.json` (beide App).
 
 ### 8.9 Sicherheit
 
@@ -1335,21 +1449,38 @@ erlaubt.
 
 | Test | Schwerpunkt |
 |------|-------------|
-| `unit` | Queue, CRC32C, Recorder/Reader, Options, Framing, Namenshelfer, JSON/Blob, Chunkrotation, Observer |
+| `unit` | Queue, CRC32C, Recorder/Reader inkl. `ILogger`-Zustellung, Options, Framing, Namenshelfer, JSON/Blob, Chunkrotation, Observer |
 | `integration` | Record mit Varint, JSONL-Chunks, `segment`-Feld, Einzeldatei-Modus, Chunking |
 | `replay` | Byte-genaues Replay, Pacing, Richtungen, Fehlerfälle |
 | `passthrough` | Beide Richtungen inkl. Aufzeichnung und JSON-Chunks |
 | `typed` | 8-Byte-Header, Typ-Map, unbekannte IDs, Blobs, JSON-Chunks |
 
 Zusätzlich: reale Referenzdaten in `tests/events.jsonl`, Benchmark über
-`bench/benchmark.py`, Sanitizer-Presets (`asan`, `tsan`).
+`bench/benchmark.py`, Sanitizer-Presets (`asan`, `tsan`). Der Unit-Test
+`test_recorder_logger` prüft die `ILogger`-Zustellung und
+`RecorderConfig::write_summary = false`.
 
 ### 8.12 Build und Abhängigkeiten
 
 - CMake-Presets: `default`, `debug`, `asan`, `tsan`.
-- Optionen: `PRP_BUILD_TESTS`, `PRP_ASAN`, `PRP_TSAN`.
-- Bibliotheksziel `prp_core` bündelt die gesamte Anwendungslogik; das Binary
-  ist ein dünner Wrapper.
+- App-Optionen: `PRP_BUILD_TESTS`, `PRP_ASAN`, `PRP_TSAN`.
+- Bibliotheksziel `protorecrep` (statisch, Namespace
+  `protorecrep::protorecrep`) enthält den Capture-Kern; `prp_core` bündelt die
+  Anwendungslogik und linkt öffentlich gegen die Bibliothek. Das Binary ist ein
+  dünner Wrapper.
+- Die Bibliothek wird als Unterprojekt `lib/protorecrep` automatisch
+  mitgebaut. Eigenständig:
+  `cmake -S lib/protorecrep -B build/lib-protorecrep` und
+  `cmake --install build/lib-protorecrep --prefix <prefix>`.
+- Library-Optionen: `PROTORECREP_BUILD_INSTALL` (Default `ON`),
+  `PROTORECREP_ASAN`, `PROTORECREP_TSAN` (Default `OFF`).
+- Verbrauch per `add_subdirectory(...)` oder
+  `find_package(protorecrep CONFIG REQUIRED)`; exportiertes Target:
+  `protorecrep::protorecrep`, Konfiguration `protorecrepConfig.cmake`.
+- Bibliotheksabhängigkeiten: C++20, Threads, POSIX/`std::filesystem`. Kein
+  Boost, kein Protobuf, kein Asio.
+- Die App reicht `PRP_ASAN`/`PRP_TSAN` an das Bibliotheksziel weiter, damit
+  Sanitizer-Builds dieselben Flags für App und Bibliothek verwenden.
 - Docker pinnt Abseil und Protobuf, um reproduzierbare Builds zu ermöglichen.
 
 ### 8.13 Kompatibilität und Versionierung
@@ -1359,6 +1490,9 @@ Zusätzlich: reale Referenzdaten in `tests/events.jsonl`, Benchmark über
 - Neue Felder müssen rückwärtskompatibel ergänzt werden.
 - Das Wire-Protokoll ist unverändert: 8-Byte-Header, Little-Endian.
 - Ein Schema-Wechsel ändert den Digest und wird beim Replay erkannt.
+- Die Bibliothek ist derzeit `0.1.0`; das CMake-Paket akzeptiert kompatible
+  Versionen mit gleicher Major-Nummer (`SameMajorVersion`). Das Capture-Format
+  ist davon unabhängig versioniert.
 
 ---
 
@@ -1493,6 +1627,29 @@ Zusätzlich: reale Referenzdaten in `tests/events.jsonl`, Benchmark über
   widerspricht der Recorder-Autorität), nur Einzeldatei (verworfen:
   schlechtere Zuordnung bei langen Sessions).
 
+### ADR-14: Capture-Kern als eigenständige Bibliothek
+
+- **Kontext:** Speicherung und Lesen des Capture-Formats sind unabhängig von
+  Netzwerk, Protobuf und CLI nutzbar; gleichzeitig soll die bestehende App
+  unverändert bleiben und keine Asio-/Protobuf-Abhängigkeit im Capture-Kern
+  entstehen.
+- **Entscheidung:** Der Kern liegt unter `lib/protorecrep/` mit Namespace
+  `protorecrep`, öffentlichen Headern unter `protorecrep/…`, statischem Ziel
+  `protorecrep::protorecrep` und CMake-Export. Konfiguration wird als
+  `RecorderConfig` übergeben; Ausgaben laufen über eine `ILogger`-Schnittstelle.
+  Die App mappt die Typen in `src/prp/lib.h` auf `prp` und behält Netzwerk,
+  JSON, Schema, CLI und Replay-Pacing.
+- **Folgen:** Die Bibliothek ist separat baubar, installierbar und
+  wiederverwendbar; die App bleibt quellkompatibel. Dafür gibt es eine dünne
+  Alias-Schicht und zwei Namespaces. `meta.json`, `json-summary.json` und
+  Session-Verzeichnis bleiben App-Verantwortung; `summary.json` schreibt
+  standardmäßig die Bibliothek (`write_summary`).
+- **Alternativen:** Alles in der App belassen (verworfen: keine
+  Wiederverwendung), Header-only (verworfen: Threads und Datei-I/O),
+  abstrakte Config-Klassen (verworfen: unnötige Indirektion, einfache
+  Datenstrukturen reichen), Netzwerk mit in die Bibliothek ziehen (verworfen:
+  Boost.Asio wäre eine unnötige Abhängigkeit).
+
 ---
 
 ## 10. Qualitätsanforderungen
@@ -1574,6 +1731,8 @@ flowchart TD
 | R-11 | `tests/__pycache__` versioniert | Rauschen im Diff | Bei Bedarf entfernen und `.gitignore` konsequent nutzen |
 | R-12 | Docker läuft als root | Dateien gehören root | `PRP_UID`/`PRP_GID`-Hinweis in `docker.md` |
 | R-13 | JSON-Chunk kann nicht geöffnet werden | JSONL-Lücke für dieses Segment | `chunk_open_errors` in `json-summary.json`; Binäraufnahme läuft weiter |
+| R-14 | Bibliotheksgrenze verwässert | Netzwerk-/Protobuf-Code wandert in `lib/protorecrep/` und zerstört die Wiederverwendbarkeit | Review-Kriterium: Library bleibt frei von Asio, Protobuf, JSON und CLI; siehe „Mitwirken“ in der README |
+| R-15 | Vibe-Coding-Experiment ohne formale Produktionsfreigabe | Versteckte Annahmen, unvollständige Randfälle, Sicherheitslücken | Code, Tests und Sicherheitsannahmen vor produktivem Einsatz unabhängig prüfen lassen |
 
 ---
 
@@ -1591,24 +1750,32 @@ flowchart TD
 | **Framing** | Art der Nachrichtengrenzen auf dem Wire |
 | **Frame** | Eine complete Nachricht inkl. Framing-Header |
 | **High-Water-Mark** | Schwellwert, ab dem Replay oder Forwarding bremst |
+| **ILogger** | Ausgabesenke der Bibliothek; die App liefert ihre Log- und Fortschrittsausgabe durch, `nullptr` schweigt |
 | **JSONL** | Zeilenorientiertes JSON, eine Event pro Zeile |
 | **Passthrough** | Live-Weiterleitung mit gleichzeitiger Aufzeichnung |
 | **PCRP** | Magic des protorecprep-Capture-Formats |
 | **Pacing** | Zeitliche Steuerung des Replays |
+| **protorecrep** | Eigenständige Capture-Bibliothek (Namespace und CMake-Target); nicht zu verwechseln mit der App `protorecprep` |
 | **Replay** | Byte-genaues Zurückspielen einer Aufnahme |
 | **Session** | Ein Aufzeichnungslauf mit eigenem Verzeichnis und eigener UUID |
 | **Strand** | Asio-Ausführungskontext, der Handler serialisiert |
 | **Trailer** | Abschlussdatensatz einer sauberen Capture-Datei |
 | **type_map** | Manuelle Zuordnung von Wire-Typ-IDs zu Protobuf-Nachrichten oder `@file` |
 | **Typed-Length-LE** | 8-Byte-Header: Typ-ID und Länge, Little-Endian |
+| **Vibe-Coding-Experiment** | Projekt, dessen Code und Dokumentation überwiegend im Dialog mit KI-Assistenten entstanden sind; explorativ, nicht produktionsgehärtet |
 
 ---
 
 ## Anhang A: Verwandte Dokumente
 
-- [`README.md`](../README.md) – Benutzerhandbuch, CLI-Referenz, Schnellstart
+- [`README.md`](../README.md) – Benutzerhandbuch, CLI-Referenz, Schnellstart,
+  Bibliotheks-Einbindung
 - [`docker.md`](docker.md) – Container-Betrieb, Multi-Arch, Bibliotheksprüfung
 - [`requirements.txt`](requirements.txt) – Anforderungsnotizen
+- `lib/protorecrep/CMakeLists.txt` – Bibliotheksziel, Optionen und CMake-Export
+- `lib/protorecrep/include/protorecrep/protorecrep.h` – öffentliche
+  Umbrella-API
+- `src/prp/lib.h` – Alias-Schicht der Anwendung
 - `etc/*.ini` – kommentierte Beispielkonfigurationen
 - `proto/sample.proto` – Beispielschema für Tests und Beispiele
 
@@ -1619,6 +1786,8 @@ Dieses Dokument soll bei folgenden Änderungen aktualisiert werden:
 - neue CLI-Optionen oder geänderte Defaults,
 - Änderungen am Wire-Framing oder am `.pcr`-Format,
 - neue Bausteine oder verschobene Verantwortlichkeiten,
+- Änderungen an der Bibliotheksgrenze, den öffentlichen Headern oder der
+  CMake-Schnittstelle von `protorecrep`,
 - geänderte Overflow-, Replay- oder Blob-Strategien,
 - neue Deployment-Varianten.
 

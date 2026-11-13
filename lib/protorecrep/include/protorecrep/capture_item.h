@@ -1,11 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-namespace prp {
+namespace protorecrep {
 
 enum class ItemKind : uint8_t { StreamOpen = 1, Data = 2, StreamClose = 3, Marker = 4 };
 
@@ -51,4 +52,4 @@ ItemPtr make_data(uint32_t stream_id, Direction dir, int64_t ts_ns, std::vector<
 ItemPtr make_stream_close(uint32_t stream_id, CloseReason reason, int64_t ts_ns);
 ItemPtr make_marker(int64_t ts_ns, std::string text);
 
-}  // namespace prp
+}  // namespace protorecrep

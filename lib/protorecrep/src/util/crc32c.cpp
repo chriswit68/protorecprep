@@ -1,4 +1,4 @@
-#include "prp/util/crc32c.h"
+#include "protorecrep/util/crc32c.h"
 
 #if defined(__ARM_FEATURE_CRC32)
 #include <arm_acle.h>
@@ -6,7 +6,7 @@
 
 #include <array>
 
-namespace prp {
+namespace protorecrep {
 namespace {
 
 #if !defined(__ARM_FEATURE_CRC32)
@@ -71,4 +71,4 @@ uint32_t crc32c_extend(uint32_t crc, const void* data, size_t n) {
 
 uint32_t crc32c(const void* data, size_t n, uint32_t seed) { return crc32c_extend(seed, data, n); }
 
-}  // namespace prp
+}  // namespace protorecrep

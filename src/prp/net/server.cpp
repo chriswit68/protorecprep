@@ -15,9 +15,9 @@
 
 #include <sys/socket.h>
 
+#include "prp/lib.h"
 #include "prp/net/framer.h"
 #include "prp/util/log.h"
-#include "prp/util/text.h"
 
 namespace prp {
 namespace asio = boost::asio;

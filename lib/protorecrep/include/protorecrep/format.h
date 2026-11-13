@@ -7,10 +7,10 @@
 #include <string_view>
 #include <vector>
 
-#include "prp/core/capture_item.h"
-#include "prp/util/sha256.h"
+#include "protorecrep/capture_item.h"
+#include "protorecrep/util/sha256.h"
 
-namespace prp::rec {
+namespace protorecrep::rec {
 
 inline constexpr std::array<uint8_t, 4> kMagic{{'P', 'C', 'R', 'P'}};
 inline constexpr uint16_t kFormatVersion = 1;
@@ -99,4 +99,4 @@ struct StreamCloseInfo {
 };
 bool parse_stream_close(const uint8_t* payload, size_t len, StreamCloseInfo& out);
 
-}  // namespace prp::rec
+}  // namespace protorecrep::rec

@@ -10,11 +10,12 @@
 #include <thread>
 #include <vector>
 
-#include "prp/core/item_queue.h"
-#include "prp/record/format.h"
-#include "prp/util/fs.h"
+#include "protorecrep/format.h"
+#include "protorecrep/logger.h"
+#include "protorecrep/queue.h"
+#include "protorecrep/util/fs.h"
 
-namespace prp {
+namespace protorecrep {
 
 struct RecorderConfig {
   fs::path out_dir;
@@ -30,6 +31,10 @@ struct RecorderConfig {
   bool durable = false;
   uint64_t rotate_bytes = 0;  // 0 = no size cap
   std::chrono::milliseconds rotate_interval{60 * 1000};  // capture chunk duration
+
+  // Writes summary.json into out_dir when the writer stops. Callers that own
+  // their own metadata files can disable it.
+  bool write_summary = true;
 };
 
 struct RecorderStats {
@@ -44,10 +49,11 @@ struct RecorderStats {
 };
 
 // Owns the capture file writer thread. All disk IO happens on that thread;
-// producers only enqueue immutable items.
+// producers only enqueue immutable items. The logger is borrowed and must
+// outlive the recorder; a null logger disables all library output.
 class Recorder {
  public:
-  explicit Recorder(RecorderConfig config);
+  explicit Recorder(RecorderConfig config, ILogger* logger = nullptr);
   ~Recorder();
 
   Recorder(const Recorder&) = delete;
@@ -90,6 +96,7 @@ class Recorder {
   std::string segment_path(uint32_t index) const;
 
   RecorderConfig config_;
+  ILogger* logger_ = nullptr;
   BoundedItemQueue queue_;
   std::thread thread_;
   std::atomic<bool> stopping_{false};
@@ -122,4 +129,4 @@ class Recorder {
   ItemObserver observer_;
 };
 
-}  // namespace prp
+}  // namespace protorecrep

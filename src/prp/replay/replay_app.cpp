@@ -24,11 +24,10 @@
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 
+#include "prp/lib.h"
 #include "prp/net/client.h"
 #include "prp/proto/schema.h"
-#include "prp/record/reader.h"
 #include "prp/util/log.h"
-#include "prp/util/text.h"
 
 namespace prp {
 namespace {

@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-#include "prp/record/format.h"
+#include "prp/lib.h"
 
 namespace prp {
 

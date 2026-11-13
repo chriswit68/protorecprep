@@ -1,9 +1,9 @@
-#include "prp/util/text.h"
+#include "protorecrep/util/text.h"
 
 #include <chrono>
 #include <cstdio>
 
-namespace prp {
+namespace protorecrep {
 
 int64_t now_wall_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -78,4 +78,4 @@ std::string format_bytes(uint64_t bytes) {
   return buf;
 }
 
-}  // namespace prp
+}  // namespace protorecrep

@@ -5,7 +5,7 @@
 #include <string>
 #include <string_view>
 
-namespace prp {
+namespace protorecrep {
 
 namespace fs = std::filesystem;
 
@@ -34,4 +34,4 @@ std::string hostname();
 std::string utc_timestamp_compact();
 std::string iso8601_now();
 
-}  // namespace prp
+}  // namespace protorecrep

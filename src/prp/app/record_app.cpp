@@ -24,11 +24,8 @@
 #include "prp/net/framer.h"
 #include "prp/net/server.h"
 #include "prp/proto/schema.h"
-#include "prp/record/reader.h"
-#include "prp/record/recorder.h"
-#include "prp/util/fs.h"
+#include "prp/lib.h"
 #include "prp/util/log.h"
-#include "prp/util/text.h"
 
 namespace prp {
 namespace {
@@ -333,7 +330,7 @@ int run_server_mode(const Options& options, std::string& err) {
   recorder_config.rotate_bytes = options.rotate_bytes;
   recorder_config.rotate_interval = options.rotate_interval;
 
-  Recorder recorder(recorder_config);
+  Recorder recorder(recorder_config, &app_logger());
 
   // JSON output defaults to one file per capture chunk (capture-NNNNNN.jsonl)
   // so events can be matched to their binary chunk. An explicit --json-file

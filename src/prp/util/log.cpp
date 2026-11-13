@@ -109,4 +109,9 @@ bool progress_stderr_is_tty() {
   return tty;
 }
 
+AppLogger& app_logger() {
+  static AppLogger logger;
+  return logger;
+}
+
 }  // namespace prp

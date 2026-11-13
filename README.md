@@ -14,6 +14,14 @@ Weiterführende Dokumentation: das [arc42-Software-Design-Dokument](doc/software
 beschreibt Architektur, Laufzeitverhalten und Entscheidungen; das
 [Docker-Handbuch](doc/docker.md) behandelt Containerbetrieb und Multi-Arch-Builds.
 
+> **Hinweis: Vibe-Coding-Experiment**
+>
+> Dieses Projekt ist ein **Vibe-Coding-Experiment**. Code und Dokumentation
+> sind überwiegend im Dialog mit KI-Assistenten entstanden. Das Ergebnis ist
+> als explorativer Prototyp gedacht, nicht als produktionsgehärtete Software.
+> Vor einem Einsatz in kritischen Umgebungen sollten Code, Tests und
+> Sicherheitsannahmen unabhängig geprüft werden.
+
 ## Überblick
 
 - **Vier Modi:** `record`, `replay`, `passthrough`, `inspect`
@@ -26,6 +34,8 @@ beschreibt Architektur, Laufzeitverhalten und Entscheidungen; das
 - **Chunking:** Aufteilung der Binäraufnahme nach Zeit und/oder Größe
 - **Passthrough:** live weiterleiten und gleichzeitig aufzeichnen
 - **Robuste Aufnahme:** CRC32C, Trailer, Wiederherstellung abgeschnittener Dateien
+- **Eigenständige Capture-Library:** Speichern und Lesen als wiederverwendbare
+  C++-Bibliothek unter `lib/protorecrep/` (ohne Netzwerk- und Protobuf-Code)
 
 ## Modi
 
@@ -278,6 +288,90 @@ Das Binary liegt danach unter `build/default/protorecprep`.
 | `PRP_BUILD_TESTS`  | `ON`    | Tests mitbauen               |
 | `PRP_ASAN`         | `OFF`   | AddressSanitizer aktivieren  |
 | `PRP_TSAN`         | `OFF`   | ThreadSanitizer aktivieren   |
+
+Hinweis: Der Capture-Kern wird als Unterprojekt `lib/protorecrep` automatisch
+mitgebaut. Für einen eigenständigen Library-Build siehe
+[Capture-Bibliothek `protorecrep`](#capture-bibliothek-protorecrep).
+
+## Capture-Bibliothek `protorecrep`
+
+Der speichernde und lesende Kern ist als eigenständige, statische
+C++-Bibliothek unter `lib/protorecrep/` abgelegt. Die Anwendung bindet sie ein;
+dieselbe Bibliothek kann aber auch ohne die `protorecprep`-App verwendet
+werden.
+
+- **Verantwortung:** Capture-Dateien schreiben und lesen, CRC32C/SHA-256,
+  bounded Queue, Dateisystem- und Texthelfer.
+- **Nicht enthalten:** Netzwerk, Boost.Asio, Protobuf, CLI, JSON-Sidecar und
+  Replay-Pacing. Diese Logik bleibt in der Anwendung.
+- **Öffentliche Header:** `#include "protorecrep/protorecrep.h"` oder gezielt
+  `protorecrep/recorder.h`, `protorecrep/reader.h`, `protorecrep/logger.h`, …
+- **Namespace:** `protorecrep`. Die App mappt die Typen in `src/prp/lib.h` auf
+  ihren historischen Namespace `prp`.
+- **Abhängigkeiten:** C++20, Threads und POSIX/`std::filesystem`; kein Boost
+  und kein Protobuf.
+
+### Einbinden im eigenen CMake-Projekt
+
+Als Unterprojekt:
+
+```cmake
+add_subdirectory(path/to/protorecrep/lib/protorecrep)
+target_link_libraries(my_app PRIVATE protorecrep::protorecrep)
+```
+
+Oder als installiertes Paket:
+
+```bash
+cmake -S lib/protorecrep -B build/lib-protorecrep
+cmake --build build/lib-protorecrep -j
+cmake --install build/lib-protorecrep --prefix /pfad/zum/prefix
+```
+
+```cmake
+find_package(protorecrep CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE protorecrep::protorecrep)
+```
+
+Die Optionen des eigenständigen Library-Builds sind
+`PROTORECREP_BUILD_INSTALL` (Default `ON`), `PROTORECREP_ASAN` und
+`PROTORECREP_TSAN` (beide Default `OFF`).
+
+### Minimalbeispiel
+
+```cpp
+#include "protorecrep/protorecrep.h"
+
+protorecrep::RecorderConfig config;
+config.out_dir = "/tmp/capture";
+config.session_id = "0123456789abcdef0123456789abcdef";
+config.write_summary = false;  // Metadaten schreibt die App
+
+protorecrep::Recorder recorder(config);  // nullptr = stille Ausgabe
+std::string err;
+if (!recorder.start(err)) {
+  // Fehler behandeln
+}
+recorder.submit(protorecrep::make_stream_open(1, protorecrep::now_wall_ns(), "peer", ""));
+recorder.submit(protorecrep::make_data(1, protorecrep::Direction::In,
+                                       protorecrep::now_wall_ns(),
+                                       std::vector<uint8_t>{'h', 'i'}));
+recorder.stop();
+
+protorecrep::CaptureReader reader;
+if (!reader.open(config.out_dir / protorecrep::rec::segment_capture_name(1), err)) {
+  // Fehler behandeln
+}
+protorecrep::CaptureRecord record;
+while (reader.next(record, err) == protorecrep::ReadStatus::Record) {
+  // record.type, record.stream_id, record.data, ...
+}
+```
+
+Log- und Fortschrittsausgaben gehen über die Schnittstelle
+`protorecrep::ILogger`. Ein `nullptr`-Logger unterdrückt sie vollständig; die
+App übergibt `&prp::app_logger()`, damit Library-Meldungen exakt wie die übrigen
+Anwendungslogs aussehen. Die Library schreibt selbst nie auf `stderr`/`stdout`.
 
 ## CLI-Referenz
 
@@ -644,7 +738,7 @@ ctest --test-dir build/default --output-on-failure
 
 | Test | Inhalt |
 |------|--------|
-| `unit` | Queue, CRC32C, Recorder/Reader, Options, Framing, JSON- und Blob-Konvertierung |
+| `unit` | Queue, CRC32C, Recorder/Reader inkl. `ILogger`, Options, Framing, JSON- und Blob-Konvertierung |
 | `integration` | Record-Modus mit Varint-Framing, JSONL und Chunking |
 | `replay` | Byte-genaues Replay, Pacing, Richtungen und Fehlerfälle |
 | `passthrough` | Live-Weiterleitung in beide Richtungen inkl. Aufzeichnung |
@@ -677,24 +771,32 @@ plus JSONL-Sidecar über Loopback. Weitere Optionen: `--message-size`,
 ## Projektstruktur
 
 ```text
+lib/protorecrep/             # eigenständige Capture-Bibliothek (kein Netzwerk/Protobuf)
+├── include/protorecrep/     # öffentliche Header (Recorder, Reader, Format, ILogger, Utils)
+├── src/                     # Implementierung von Recorder, Reader, Queue und Hilfsfunktionen
+└── cmake/                   # CMake-Export für find_package(protorecrep)
 src/
 ├── main.cpp                 # Einstiegspunkt und Kommando-Dispatch
-└── prp/
+└── prp/                     # Anwendungsschicht (Namespace prp)
     ├── app/                 # record/passthrough/inspect-Ablauf
     ├── cli/                 # Optionsparser, INI-Loader, Hilfe
-    ├── core/                # Capture-Items und bounded Queue
     ├── json/                # JSONL-Writer, Blob-Extraktion
     ├── net/                 # Server, Client, Framer, Forwarder
     ├── proto/               # Schema-Laden, Descriptor-Handling
-    ├── record/              # Capture-Format, Recorder, Reader
-    ├── replay/              # Replay-Engine
-    └── util/                # Log, CRC32C, SHA-256, Base64, FS, Text
+    ├── replay/              # Replay-Engine inkl. Pacing und Reconnect
+    ├── util/                # App-Logging (AppLogger) und Base64
+    └── lib.h                # Aliase von protorecrep-Typen in den Namespace prp
 proto/sample.proto           # Beispielschema für Tests und Beispiele
 etc/                         # Beispielkonfigurationen
 tests/                       # Unit- und End-to-End-Tests
 bench/                       # Durchsatz-Benchmark
 doc/                         # Docker-Handbuch und arc42-Design-Dokument
 ```
+
+Die Anwendung enthält die Netzwerk-, Protobuf-, JSON- und CLI-Logik. Der
+Capture-Kern unter `lib/protorecrep/` ist davon unabhängig und kann separat
+gebaut, installiert und wiederverwendet werden. `src/prp/lib.h` hält die
+historischen `prp`-Namen für den Anwendungscode stabil.
 
 ## Fehlerbehebung
 
@@ -750,6 +852,12 @@ Der Container läuft standardmäßig als `root`. Für Host-UID-Betrieb siehe
   `cmake --build --preset default && ctest --preset default`.
 - Neue Optionen oder Formate benötigen Tests sowie eine Aktualisierung von
   `README.md`, der Hilfe in `src/prp/cli/options.cpp` und ggf. `doc/docker.md`.
+- Die Bibliotheksgrenze respektieren: `lib/protorecrep/` bleibt frei von
+  Netzwerk-, Boost.Asio-, Protobuf-, CLI- und JSON-Sidecar-Code. Neue
+  Capture-Formate oder Lese-/Schreibfunktionen gehören in die Library, alles
+  Protokoll- und Anwendungsspezifische bleibt unter `src/prp/`.
+- Öffentliche Library-Header nur unter `lib/protorecrep/include/protorecrep/`
+  ändern; die App greift über `src/prp/lib.h` auf die Typen zu.
 - Den vorhandenen C++20-Stil und die Warnoptionen des Projekts beibehalten
   (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion`).
 

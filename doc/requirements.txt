@@ -1,5 +1,11 @@
 Anforderungspapier für die Applikation protorecrep
 
+Hinweis: Dieses Dokument ist die ursprüngliche Anforderungsskizze und wird als
+historischer Ausgangspunkt erhalten. Es beschreibt nicht den aktuellen
+Funktionsumfang (inzwischen u. a. vier Modi inkl. `inspect`, entfernter
+Nachrichtenfilter, C++20). Maßgeblich sind die [`README.md`](../README.md) und
+das [`Software-Design-Dokument`](software-design.md).
+
 1. Einleitung
 Ziel dieser Anwendung ist die Aufzeichnung und Wiedergabe von Netzwerkdatenströmen, die Informationen im protobuf-Format beinhalten. 
 Sie soll unter Linux und Macos laufen und in c++ ab Version 17 programmiert werden.

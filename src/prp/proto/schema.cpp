@@ -7,7 +7,7 @@
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/json/json.h>
 
-#include "prp/util/fs.h"
+#include "prp/lib.h"
 #include "prp/util/log.h"
 
 namespace prp {

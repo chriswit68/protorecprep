@@ -7,9 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "prp/core/item_queue.h"
-#include "prp/record/format.h"
-#include "prp/util/fs.h"
+#include "prp/lib.h"
 #include "prp/util/log.h"
 
 namespace prp {

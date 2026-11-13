@@ -1,4 +1,4 @@
-#include "prp/util/fs.h"
+#include "protorecrep/util/fs.h"
 
 #include <cerrno>
 #include <chrono>
@@ -14,9 +14,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "prp/util/log.h"
-
-namespace prp {
+namespace protorecrep {
 
 bool ensure_directory(const fs::path& dir, std::string& err) {
   std::error_code ec;
@@ -160,4 +158,4 @@ std::string iso8601_now() {
   return buf;
 }
 
-}  // namespace prp
+}  // namespace protorecrep

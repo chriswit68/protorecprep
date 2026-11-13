@@ -8,9 +8,9 @@
 #include <mutex>
 #include <utility>
 
-#include "prp/core/capture_item.h"
+#include "protorecrep/capture_item.h"
 
-namespace prp {
+namespace protorecrep {
 
 enum class OverflowPolicy : uint8_t {
   // Block the producer until the writer catches up. Applies TCP backpressure
@@ -180,4 +180,4 @@ class BoundedQueue {
 
 using BoundedItemQueue = BoundedQueue<ItemPtr>;
 
-}  // namespace prp
+}  // namespace protorecrep

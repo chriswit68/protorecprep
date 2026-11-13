@@ -13,11 +13,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include "prp/core/item_queue.h"
+#include "prp/lib.h"
 #include "prp/net/framer.h"
 #include "prp/proto/schema.h"
-#include "prp/record/format.h"
-#include "prp/util/fs.h"
 
 namespace prp {
 

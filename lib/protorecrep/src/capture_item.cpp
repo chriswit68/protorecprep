@@ -1,8 +1,8 @@
-#include "prp/core/item_queue.h"
+#include "protorecrep/capture_item.h"
 
 #include <utility>
 
-namespace prp {
+namespace protorecrep {
 namespace {
 
 std::shared_ptr<CaptureItem> make_item(ItemKind kind, uint32_t stream_id, Direction dir, int64_t ts_ns) {
@@ -58,4 +58,4 @@ ItemPtr make_marker(int64_t ts_ns, std::string text) {
   return item;
 }
 
-}  // namespace prp
+}  // namespace protorecrep

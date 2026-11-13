@@ -1,4 +1,4 @@
-#include "prp/record/recorder.h"
+#include "protorecrep/recorder.h"
 
 #include <cerrno>
 #include <cinttypes>
@@ -10,11 +10,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "prp/util/crc32c.h"
-#include "prp/util/log.h"
-#include "prp/util/text.h"
+#include "internal/log.h"
+#include "protorecrep/util/crc32c.h"
+#include "protorecrep/util/text.h"
 
-namespace prp {
+namespace protorecrep {
 namespace {
 
 // Reuse the shared helper so capture chunks and JSON chunks always share a stem.
@@ -22,8 +22,10 @@ std::string segment_name(uint32_t index) { return rec::segment_capture_name(inde
 
 }  // namespace
 
-Recorder::Recorder(RecorderConfig config)
-    : config_(std::move(config)), queue_(config_.max_queue_bytes, config_.overflow) {}
+Recorder::Recorder(RecorderConfig config, ILogger* logger)
+    : config_(std::move(config)),
+      logger_(logger),
+      queue_(config_.max_queue_bytes, config_.overflow) {}
 
 Recorder::~Recorder() { stop(); }
 
@@ -39,8 +41,8 @@ bool Recorder::start(std::string& err) {
     return false;
   }
   thread_ = std::thread([this] { run(); });
-  log_printf(LogLevel::Info, "recorder started: %s (framing=%s)", config_.out_dir.c_str(),
-             rec::framing_name(config_.framing));
+  internal::logf(logger_, LogLevel::Info, "recorder started: %s (framing=%s)", config_.out_dir.c_str(),
+                 rec::framing_name(config_.framing));
   return true;
 }
 
@@ -57,8 +59,9 @@ PushResult Recorder::submit(const ItemPtr& item) {
     // Log at most every 100 drops to keep the hot path cheap.
     const uint64_t dropped = queue_.dropped_items();
     if (dropped % 100 == 1) {
-      log_printf(LogLevel::Warn, "capture queue full, dropped %" PRIu64 " items (%s buffered)", dropped,
-                 format_bytes(queue_.buffered_bytes()).c_str());
+      internal::logf(logger_, LogLevel::Warn,
+                     "capture queue full, dropped %" PRIu64 " items (%s buffered)", dropped,
+                     format_bytes(queue_.buffered_bytes()).c_str());
     }
   }
   return result;
@@ -165,7 +168,7 @@ bool Recorder::open_segment(std::string& err) {
       }
     }
   }
-  log_printf(LogLevel::Debug, "capture segment %s opened", path.c_str());
+  internal::logf(logger_, LogLevel::Debug, "capture segment %s opened", path.c_str());
   return true;
 }
 
@@ -294,7 +297,7 @@ void Recorder::fail(std::string error) {
     std::lock_guard<std::mutex> lock(error_mutex_);
     if (error_.empty()) error_ = error;
   }
-  log_printf(LogLevel::Error, "recorder failure: %s", error.c_str());
+  internal::logf(logger_, LogLevel::Error, "recorder failure: %s", error.c_str());
   if (fd_ >= 0) {
     ::close(fd_);
     fd_ = -1;
@@ -373,11 +376,11 @@ void Recorder::run() {
     ::close(fd_);
     fd_ = -1;
   }
-  write_summary(!failed_.load(std::memory_order_relaxed));
+  if (config_.write_summary) write_summary(!failed_.load(std::memory_order_relaxed));
   const RecorderStats s = stats();
-  log_printf(LogLevel::Info,
-             "recorder stopped: records=%" PRIu64 " data=%s segments=%" PRIu64 " dropped=%" PRIu64,
-             s.records, format_bytes(s.data_bytes).c_str(), s.segments, s.dropped_items);
+  internal::logf(logger_, LogLevel::Info,
+                 "recorder stopped: records=%" PRIu64 " data=%s segments=%" PRIu64 " dropped=%" PRIu64,
+                 s.records, format_bytes(s.data_bytes).c_str(), s.segments, s.dropped_items);
 }
 
 void Recorder::write_summary(bool clean) {
@@ -397,8 +400,8 @@ void Recorder::write_summary(bool clean) {
   json += "}\n";
   std::string err;
   if (!write_file_atomic(config_.out_dir / "summary.json", json, err)) {
-    log_printf(LogLevel::Warn, "could not write summary.json: %s", err.c_str());
+    internal::logf(logger_, LogLevel::Warn, "could not write summary.json: %s", err.c_str());
   }
 }
 
-}  // namespace prp
+}  // namespace protorecrep

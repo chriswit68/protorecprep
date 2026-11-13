@@ -5,10 +5,10 @@
 #include <string>
 #include <vector>
 
-#include "prp/record/format.h"
-#include "prp/util/fs.h"
+#include "protorecrep/format.h"
+#include "protorecrep/util/fs.h"
 
-namespace prp {
+namespace protorecrep {
 
 struct ScanStats {
   bool header_ok = false;
@@ -100,4 +100,4 @@ class CaptureReader {
   uint64_t file_size_ = 0;
 };
 
-}  // namespace prp
+}  // namespace protorecrep

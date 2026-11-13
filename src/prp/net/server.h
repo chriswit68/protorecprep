@@ -12,9 +12,8 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
+#include "prp/lib.h"
 #include "prp/net/forwarder.h"
-#include "prp/record/format.h"
-#include "prp/record/recorder.h"
 
 namespace prp {
 

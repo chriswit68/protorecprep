@@ -1,4 +1,4 @@
-#include "prp/record/reader.h"
+#include "protorecrep/reader.h"
 
 #include <algorithm>
 #include <array>
@@ -9,10 +9,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "prp/util/bytes.h"
-#include "prp/util/crc32c.h"
+#include "protorecrep/util/bytes.h"
+#include "protorecrep/util/crc32c.h"
 
-namespace prp {
+namespace protorecrep {
 namespace {
 
 bool read_exact(FILE* f, void* dst, size_t n, size_t& got) {
@@ -368,4 +368,4 @@ ReadStatus CaptureReader::next(CaptureRecord& out, std::string& detail) {
   return ReadStatus::Record;
 }
 
-}  // namespace prp
+}  // namespace protorecrep

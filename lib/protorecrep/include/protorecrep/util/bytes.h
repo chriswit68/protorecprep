@@ -1,11 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <string>
 #include <vector>
 
-namespace prp {
+namespace protorecrep {
 
 // Explicit little-endian encoding helpers. The record format is LE on every
 // platform so that captures are portable between Linux and macOS.
@@ -64,4 +64,4 @@ inline uint64_t load_u64le_unaligned(const void* p) {
   return v;
 }
 
-}  // namespace prp
+}  // namespace protorecrep

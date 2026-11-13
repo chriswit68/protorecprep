@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-namespace prp {
+namespace protorecrep {
 
 using Sha256Digest = std::array<uint8_t, 32>;
 
@@ -31,4 +31,4 @@ class Sha256 {
   bool finished_ = false;
 };
 
-}  // namespace prp
+}  // namespace protorecrep

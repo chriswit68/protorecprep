@@ -24,17 +24,14 @@ find_package(Threads REQUIRED)
 find_package(Boost 1.80 REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 
+# Capture storage/read core. The library has no networking, protobuf or
+# application-logic dependencies; it is also buildable and installable on its
+# own (see lib/protorecrep/CMakeLists.txt).
+add_subdirectory(lib/protorecrep)
+
 add_library(prp_core
   src/prp/util/log.cpp
-  src/prp/util/crc32c.cpp
-  src/prp/util/sha256.cpp
   src/prp/util/base64.cpp
-  src/prp/util/fs.cpp
-  src/prp/util/text.cpp
-  src/prp/core/item_queue.cpp
-  src/prp/record/format.cpp
-  src/prp/record/recorder.cpp
-  src/prp/record/reader.cpp
   src/prp/proto/schema.cpp
   src/prp/json/json_writer.cpp
   src/prp/net/framer.cpp
@@ -47,6 +44,7 @@ add_library(prp_core
 )
 target_include_directories(prp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(prp_core PUBLIC
+  protorecrep::protorecrep
   Boost::headers
   protobuf::libprotobuf
   protobuf::libprotoc
@@ -57,10 +55,14 @@ target_compile_options(prp_core PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconv
 if(PRP_ASAN)
   target_compile_options(prp_core PUBLIC -fsanitize=address -fno-omit-frame-pointer)
   target_link_options(prp_core PUBLIC -fsanitize=address)
+  target_compile_options(protorecrep PUBLIC -fsanitize=address -fno-omit-frame-pointer)
+  target_link_options(protorecrep PUBLIC -fsanitize=address)
 endif()
 if(PRP_TSAN)
   target_compile_options(prp_core PUBLIC -fsanitize=thread -fno-omit-frame-pointer)
   target_link_options(prp_core PUBLIC -fsanitize=thread)
+  target_compile_options(protorecrep PUBLIC -fsanitize=thread -fno-omit-frame-pointer)
+  target_link_options(protorecrep PUBLIC -fsanitize=thread)
 endif()
 
 add_executable(protorecprep src/main.cpp)

@@ -4,9 +4,11 @@
 #include <string>
 #include <string_view>
 
+#include "protorecrep/logger.h"
+
 namespace prp {
 
-enum class LogLevel { Debug = 0, Info = 1, Warn = 2, Error = 3 };
+using LogLevel = protorecrep::LogLevel;
 
 void set_log_level(LogLevel level);
 LogLevel log_level();
@@ -33,5 +35,18 @@ inline void log_debug(std::string_view m) { log_message(LogLevel::Debug, m); }
 inline void log_info(std::string_view m) { log_message(LogLevel::Info, m); }
 inline void log_warn(std::string_view m) { log_message(LogLevel::Warn, m); }
 inline void log_error(std::string_view m) { log_message(LogLevel::Error, m); }
+
+// Bridges the library's ILogger interface to the application's stderr logging
+// so library output and progress look exactly like native app output.
+class AppLogger final : public protorecrep::ILogger {
+ public:
+  bool enabled(LogLevel level) const override { return log_enabled(level); }
+  void log(LogLevel level, std::string_view message) override { log_message(level, message); }
+  bool progress_is_tty() const override { return progress_stderr_is_tty(); }
+  void progress(std::string_view text, bool in_place) override { set_progress_line(text, in_place); }
+  void clear_progress() override { clear_progress_line(); }
+};
+
+AppLogger& app_logger();
 
 }  // namespace prp
