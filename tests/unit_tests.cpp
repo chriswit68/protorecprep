@@ -413,6 +413,7 @@ void test_replay_options() {
     CHECK(parse({"protorecprep", "replay", "--rec", "/tmp/a.pcr", "--target", "[::1]:6000",
                  "--speed", "2.5x", "--direction", "both", "--reconnect", "--connect-timeout",
                  "250ms", "--connect-retries", "3", "--retry-interval", "10ms", "--max-gap", "1s",
+                 "--finish-timeout", "2s",
                  "--strict"},
                 options, err));
     CHECK_EQ(options.command, std::string("replay"));
@@ -426,6 +427,7 @@ void test_replay_options() {
     CHECK_EQ(options.connect_retries, uint64_t{3});
     CHECK_EQ(options.retry_interval.count(), int64_t{10});
     CHECK_EQ(options.max_gap.count(), int64_t{1000});
+    CHECK_EQ(options.finish_timeout.count(), int64_t{2000});
     CHECK(options.strict);
   }
   {
@@ -515,6 +517,9 @@ void test_replay_options() {
                  options, err));
     CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1",
                   "--connect-timeout", "0ms"},
+                 options, err));
+    CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1",
+                  "--finish-timeout", "0s"},
                  options, err));
     CHECK(!parse({"protorecprep", "replay", "--rec", "a.pcr", "--target", "h:1", "--proto-path",
                   "include"},

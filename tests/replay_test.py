@@ -589,6 +589,266 @@ def test_proto_validation(binary: str, proto: str, workdir: str) -> None:
     check("different schema" in (strict.stdout + strict.stderr), strict.stderr)
 
 
+def test_server_close_during_pause(binary: str, workdir: str) -> None:
+    """A target close during a pacing pause must be detected immediately.
+
+    Replay drains target responses, so a FIN is visible even while the runner
+    is waiting out a recorded gap. Without reading it would only fail on the
+    next write (or silently reconnect).
+    """
+    out_dir = os.path.join(workdir, "server-close")
+    record_capture(binary, out_dir, pick_port(), [(b"first", 1.0), (b"second", 0.0)])
+    files = capture_files(out_dir)
+    check(len(files) == 1, f"expected one capture, got {files}")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10.0)
+    received = bytearray()
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        conn.settimeout(10.0)
+        try:
+            chunk = conn.recv(65536)
+            received.extend(chunk)
+            conn.sendall(b"response" * 1024)
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        result = run_replay(
+            binary,
+            [
+                "--rec", files[0],
+                "--target", f"127.0.0.1:{listener.getsockname()[1]}",
+                "--speed", "0.1",  # 1 s recorded gap -> 10 s pause
+                "--log-level", "debug",
+            ],
+            timeout=20.0,
+        )
+    finally:
+        thread.join(timeout=5.0)
+        listener.close()
+
+    check(result.returncode == 1, f"lost target connection not detected: {result.stderr}")
+    check("closed by server" in result.stderr,
+          f"peer close during pause was not reported: {result.stderr}")
+    check(b"second" not in bytes(received),
+          "replay continued sending after the target closed")
+
+
+def test_idle_close_reconnects_lazily(binary: str, workdir: str) -> None:
+    """An idle target close must not burn reconnects; the next record reconnects."""
+    out_dir = os.path.join(workdir, "idle-close")
+    record_capture(binary, out_dir, pick_port(), [(b"first", 1.0), (b"second", 0.0)])
+    files = capture_files(out_dir)
+    check(len(files) == 1, f"expected one capture, got {files}")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(20.0)
+    payloads: list[bytes] = []
+
+    def serve() -> None:
+        for index in range(2):
+            conn, _ = listener.accept()
+            conn.settimeout(20.0)
+            data = bytearray()
+            try:
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if index == 0:
+                        conn.sendall(b"response" * 16)
+                        break  # close the first connection during the pause
+            finally:
+                payloads.append(bytes(data))
+                conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        result = run_replay(
+            binary,
+            [
+                "--rec", files[0],
+                "--target", f"127.0.0.1:{listener.getsockname()[1]}",
+                "--speed", "0.1",
+                "--reconnect",
+                "--log-level", "warn",
+            ],
+            timeout=30.0,
+        )
+    finally:
+        thread.join(timeout=5.0)
+        listener.close()
+
+    check(result.returncode == 0, f"lazy reconnect replay failed: {result.stderr}")
+    check(payloads == [b"first", b"second"], f"unexpected connection payloads: {payloads}")
+
+
+def test_target_responses_drained(binary: str, workdir: str) -> None:
+    """Replay must read and discard whatever the target sends back."""
+    out_dir = os.path.join(workdir, "responses")
+    payload = b"x" * 200_000
+    # The trailing record keeps replay alive long enough for the response to
+    # arrive (0.5 s recorded gap at speed 0.2 -> 2.5 s pause).
+    record_capture(binary, out_dir, pick_port(), [(payload, 0.5), (b"end", 0.0)])
+    payload += b"end"
+    files = capture_files(out_dir)
+    check(len(files) == 1, f"expected one capture, got {files}")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10.0)
+    outcome: dict[str, object] = {}
+    response = b"y" * 65536
+
+    def serve() -> None:
+        try:
+            conn, _ = listener.accept()
+            conn.settimeout(10.0)
+            try:
+                conn.sendall(response)
+                data = bytearray()
+                # Read until replay closes; closing earlier races with replay's
+                # own finish and would be reported as a lost connection.
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                outcome["data"] = bytes(data)
+            finally:
+                conn.close()
+        except OSError as exc:  # noqa: BLE001
+            # A reset during final teardown is fine once the payload arrived.
+            if "data" not in outcome:
+                outcome["error"] = str(exc)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        result = run_replay(
+            binary,
+            [
+                "--rec", files[0],
+                "--target", f"127.0.0.1:{listener.getsockname()[1]}",
+                "--speed", "0.2",
+                "--log-level", "debug",
+            ],
+            timeout=20.0,
+        )
+    finally:
+        thread.join(timeout=10.0)
+        listener.close()
+
+    check("error" not in outcome, f"response sink failed: {outcome.get('error')}")
+    check(result.returncode == 0, f"replay with responses failed: {result.stderr}")
+    check(outcome.get("data") == payload, "replayed payload was not received in full")
+    check("discarded" in result.stderr and "64.00 KiB received" in result.stderr,
+          f"target responses were not drained: {result.stderr}")
+
+
+def test_graceful_stream_close(binary: str, workdir: str) -> None:
+    """A StreamClose must be FIN + EOF drain, not a TCP RST.
+
+    The server sends an ACK for the replayed payload and then waits for replay
+    to close. Replay has to consume the ACK before the final close; closing with
+    unread receive data makes the OS emit RST, which the server sees as
+    WSAECONNRESET while waiting for the next header.
+    """
+    out_dir = os.path.join(workdir, "graceful-close")
+    payload = b"z" * 100_000
+    record_capture(binary, out_dir, pick_port(), [(payload, 0.0)])
+    files = capture_files(out_dir)
+    check(len(files) == 1, f"expected one capture, got {files}")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10.0)
+    outcome: dict[str, object] = {}
+
+    def serve() -> None:
+        try:
+            conn, _ = listener.accept()
+            conn.settimeout(10.0)
+            data = bytearray()
+            try:
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        outcome["eof"] = True
+                        break
+                    data.extend(chunk)
+                    conn.sendall(b"ack" * 1024)
+                outcome["data"] = bytes(data)
+            except ConnectionResetError as exc:  # noqa: BLE001
+                outcome["reset"] = str(exc)
+            finally:
+                conn.close()
+        except OSError as exc:  # noqa: BLE001
+            outcome["error"] = str(exc)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        result = run_replay(
+            binary,
+            [
+                "--rec", files[0],
+                "--target", f"127.0.0.1:{listener.getsockname()[1]}",
+                "--speed", "0",
+                "--finish-timeout", "2s",
+                "--log-level", "debug",
+            ],
+            timeout=20.0,
+        )
+    finally:
+        thread.join(timeout=10.0)
+        listener.close()
+
+    check("error" not in outcome, f"graceful-close server failed: {outcome.get('error')}")
+    check("reset" not in outcome, f"replay closed with TCP RST: {outcome.get('reset')}")
+    check(outcome.get("eof") is True, f"replay did not send FIN/EOF: {outcome}")
+    check(outcome.get("data") == payload, "replayed payload was not received in full")
+    check(result.returncode == 0, f"graceful close replay failed: {result.stderr}")
+
+
+def test_missing_chunk_warning(binary: str, workdir: str) -> None:
+    """A hole in the chunk numbering must be reported as a recorded pause."""
+    out_dir = os.path.join(workdir, "chunk-gap-source")
+    record_capture(binary, out_dir, pick_port(), [(b"first", 0.2), (b"second", 0.0)],
+                   chunk_interval="100ms")
+    files = capture_files(out_dir)
+    check(len(files) >= 2, f"expected multiple capture chunks, got {files}")
+
+    gap_dir = os.path.join(workdir, "chunk-gap")
+    os.makedirs(gap_dir, exist_ok=True)
+    shutil.copyfile(files[0], os.path.join(gap_dir, "capture-000001.pcr"))
+    shutil.copyfile(files[-1], os.path.join(gap_dir, "capture-000005.pcr"))
+
+    _, result, _ = replay_to_sink(
+        binary, ["--dir", gap_dir], ["--speed", "0", "--direction", "in", "--log-level", "warn"]
+    )
+    check(result.returncode == 0, f"replay with chunk gap failed: {result.stderr}")
+    check("capture chunks 2..4 are missing" in result.stderr,
+          f"missing chunk warning absent: {result.stderr}")
+
+
 def main() -> int:
     binary = os.path.abspath(sys.argv[1])
     proto = os.path.abspath(sys.argv[2])
@@ -603,6 +863,11 @@ def main() -> int:
         test_unreachable_target(binary, workdir)
         test_damaged_tail(binary, workdir)
         test_direction_out(binary, workdir)
+        test_server_close_during_pause(binary, workdir)
+        test_idle_close_reconnects_lazily(binary, workdir)
+        test_target_responses_drained(binary, workdir)
+        test_graceful_stream_close(binary, workdir)
+        test_missing_chunk_warning(binary, workdir)
         if not os.environ.get("PRP_SKIP_PROTO_TESTS"):
             test_proto_validation(binary, proto, workdir)
         print("replay integration test passed")

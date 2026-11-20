@@ -27,12 +27,16 @@ struct ClientConfig {
   size_t max_queue_bytes = 256ull * 1024 * 1024;
   // Buffer size for the optional read direction (passthrough responses).
   size_t read_buffer = 64ull * 1024;
+  // When reads are enabled, wait at most this long for the peer's EOF after
+  // sending FIN. Avoids closing with unread data, which would emit a TCP RST.
+  std::chrono::milliseconds close_timeout{30000};
 };
 
 // Asynchronous TCP client used by replay mode and by the passthrough forwarder.
 //
-// Reading is opt-in: replay never calls start_reading(), so the write-only
-// behavior is unchanged. Passthrough enables reads to receive target responses.
+// Reading is opt-in: replay enables it to drain target responses (and to detect
+// a peer close while replay is idle); passthrough enables it to forward those
+// responses to the recorded client.
 //
 // Thread-safety: the constructor takes the executor that runs the owning
 // component's strand. All public methods must be called from that executor,
@@ -54,7 +58,9 @@ class ClientConnection : public std::enable_shared_from_this<ClientConnection> {
   void restart();
 
   void write(std::vector<uint8_t> bytes);
-  // Closes the socket after all queued bytes have been written.
+  // Sends FIN after all queued bytes have been written. When reading is
+  // enabled, keeps draining responses until the peer sends EOF (or
+  // close_timeout expires) so the final close never emits a TCP RST.
   void close_after_flush();
   // Drops the connection and any queued data immediately.
   void abort();
@@ -93,6 +99,7 @@ class ClientConnection : public std::enable_shared_from_this<ClientConnection> {
   void do_read();
   void on_read(const boost::system::error_code& ec, size_t transferred);
   void report_io_error(const std::string& message);
+  void begin_close_drain();
   void finish_close();
   void notify(Callback& callback);
   void notify_error(const std::string& message);
@@ -103,6 +110,7 @@ class ClientConnection : public std::enable_shared_from_this<ClientConnection> {
   boost::asio::ip::tcp::socket socket_;
   boost::asio::steady_timer connect_timer_;
   boost::asio::steady_timer retry_timer_;
+  boost::asio::steady_timer close_timer_;
 
   std::deque<std::vector<uint8_t>> queue_;
   size_t front_offset_ = 0;
@@ -128,6 +136,8 @@ class ClientConnection : public std::enable_shared_from_this<ClientConnection> {
   bool read_paused_ = false;
   bool io_error_reported_ = false;
   bool close_requested_ = false;
+  enum class ClosePhase { None, WriteShutdown, Done };
+  ClosePhase close_phase_ = ClosePhase::None;
   bool closed_ = false;
   bool failed_ = false;
 };

@@ -38,10 +38,10 @@ using ErrorCode = boost::system::error_code;
 constexpr size_t kTotalHighWater = 64ull * 1024 * 1024;
 constexpr size_t kStreamQueueLimit = 256ull * 1024 * 1024;
 constexpr auto kBackpressureRetry = std::chrono::milliseconds(5);
-constexpr auto kFinishTimeout = std::chrono::seconds(30);
 constexpr unsigned kMaxReconnects = 10;
 constexpr int64_t kProgressIntervalNs = 100'000'000;      // in-place refresh: at most every 100 ms
 constexpr int64_t kProgressLineIntervalNs = 1'000'000'000;  // line output: at most every 1 s
+constexpr int64_t kLargeGapWarnNs = 10'000'000'000;        // warn about waits >= 10 s
 
 bool selected_direction(const Options& options, Direction dir) {
   switch (options.replay_direction) {
@@ -50,6 +50,42 @@ bool selected_direction(const Options& options, Direction dir) {
     case ReplayDirection::Both: return true;
   }
   return false;
+}
+
+std::string format_delay(int64_t ns) {
+  int64_t seconds = ns / 1'000'000'000;
+  if (seconds < 0) seconds = 0;
+  const int64_t hours = seconds / 3600;
+  seconds %= 3600;
+  const int64_t minutes = seconds / 60;
+  seconds %= 60;
+  char buf[64];
+  if (hours > 0) {
+    std::snprintf(buf, sizeof(buf), "%lldh %lldm %llds", static_cast<long long>(hours),
+                  static_cast<long long>(minutes), static_cast<long long>(seconds));
+  } else if (minutes > 0) {
+    std::snprintf(buf, sizeof(buf), "%lldm %llds", static_cast<long long>(minutes),
+                  static_cast<long long>(seconds));
+  } else {
+    std::snprintf(buf, sizeof(buf), "%llds", static_cast<long long>(seconds));
+  }
+  return buf;
+}
+
+// Only well-formed capture-NNNNNN.pcr names take part in the continuity check.
+bool capture_chunk_index(const fs::path& path, uint32_t& index) {
+  const std::string name = path.filename().string();
+  if (name.rfind("capture-", 0) != 0 || path.extension() != ".pcr") return false;
+  if (name.size() <= 12) return false;  // "capture-" + ".pcr"
+  const std::string digits = name.substr(8, name.size() - 12);
+  if (digits.empty() || digits.size() > 6) return false;
+  uint32_t value = 0;
+  for (char c : digits) {
+    if (c < '0' || c > '9') return false;
+    value = value * 10 + static_cast<uint32_t>(c - '0');
+  }
+  index = value;
+  return true;
 }
 
 std::string direction_name(ReplayDirection dir) {
@@ -227,6 +263,20 @@ class ReplayRunner {
         continue;
       }
 
+      // Missing chunks turn into a long recorded pause at replay time. Make
+      // that visible instead of silently waiting (or reconnecting) later.
+      uint32_t chunk_index = 0;
+      if (capture_chunk_index(path, chunk_index)) {
+        if (have_chunk_index_ && chunk_index > last_chunk_index_ + 1) {
+          log_printf(LogLevel::Warn,
+                     "capture chunks %u..%u are missing before %s; the recorded gap will be "
+                     "replayed as a pause",
+                     last_chunk_index_ + 1, chunk_index - 1, path.string().c_str());
+        }
+        last_chunk_index_ = chunk_index;
+        have_chunk_index_ = true;
+      }
+
       const rec::FileHeader& header = reader_.header();
       if (!have_session_) {
         session_uuid_ = header.session_uuid;
@@ -355,7 +405,17 @@ class ReplayRunner {
     int64_t gap = current_.ts_ns - last_ts_ns_;
     last_ts_ns_ = current_.ts_ns;
     if (gap < 0) gap = 0;
-    timeline_ns_ += scaled_delay_ns(gap, options_);
+    const int64_t delay = scaled_delay_ns(gap, options_);
+    if (delay >= kLargeGapWarnNs && (!large_gap_warned_ || delay > warned_gap_ns_ * 2)) {
+      large_gap_warned_ = true;
+      warned_gap_ns_ = delay;
+      log_printf(LogLevel::Warn,
+                 "large recorded gap of %s before %s at speed=%s; the target may close an idle "
+                 "connection -- consider --max-gap",
+                 format_delay(delay).c_str(), reader_.path().string().c_str(),
+                 std::to_string(options_.replay_speed).c_str());
+    }
+    timeline_ns_ += delay;
   }
 
   bool backpressured() const {
@@ -407,6 +467,13 @@ class ReplayRunner {
         StreamMeta& meta = streams_[current_.stream_id];
         if (meta.peer.empty()) meta.peer = current_.peer;
         if (meta.type_name.empty()) meta.type_name = current_.type_name;
+        // A fresh StreamOpen (for example at the start of a new chunk) means
+        // the old connection must not be reused. Drop stale entries here so
+        // the next Data record creates a new client deterministically.
+        const auto it = stream_clients_.find(current_.stream_id);
+        if (it != stream_clients_.end() && (it->second->closed() || it->second->closing())) {
+          stream_clients_.erase(it);
+        }
         break;
       }
       case rec::RecordType::Data: {
@@ -455,6 +522,7 @@ class ReplayRunner {
     config.retry_interval = options_.retry_interval;
     config.connect_retries = options_.connect_retries;
     config.max_queue_bytes = kStreamQueueLimit;
+    config.close_timeout = options_.finish_timeout;
 
     auto client = std::make_shared<ClientConnection>(strand_, config);
     live_clients_.insert(client);
@@ -476,7 +544,17 @@ class ReplayRunner {
     });
     client->set_error_callback(
         [this, stream_id, weak](const std::string& message) { on_client_error(stream_id, weak, message); });
+    // Drain whatever the target sends back. Without this, a request/response
+    // protocol fills the socket buffers and the target drops the connection;
+    // a peer close would also stay invisible until the next write.
+    client->set_data_callback([this, stream_id](std::vector<uint8_t> bytes) {
+      if (completed_) return;
+      bytes_received_ += bytes.size();
+      log_printf(LogLevel::Debug, "stream %u: discarded %zu response byte(s) from target",
+                 stream_id, bytes.size());
+    });
     client->start();
+    client->start_reading();
     return client;
   }
 
@@ -489,14 +567,27 @@ class ReplayRunner {
     const auto it = stream_clients_.find(stream_id);
     const bool current = it != stream_clients_.end() && it->second == client;
     if (!current) {
-      // A retired connection failed while flushing. There is no stream to
-      // resume, so treat it as a normal replay failure.
-      fail("stream " + std::to_string(stream_id) + ": " + message);
+      // A retired connection failed after its stream was already closed by
+      // the recording. It must not abort a healthy replay; just release it.
+      log_printf(LogLevel::Warn, "stream %u connection error after it finished: %s", stream_id,
+                 message.c_str());
+      client->abort();
       return;
     }
 
     const unsigned reconnects = reconnect_counts_[stream_id];
     if (options_.reconnect && client->connects() > 0 && reconnects < kMaxReconnects) {
+      if (client->queued_bytes() == 0 && !client->closing()) {
+        // Nothing to resume: a long idle gap may make the target close the
+        // connection repeatedly. Drop it and open a fresh one with the next
+        // Data record instead of burning through the reconnect budget.
+        log_printf(LogLevel::Info,
+                   "stream %u target connection closed while idle; the next record will open a "
+                   "new connection",
+                   stream_id);
+        client->abort();
+        return;
+      }
       reconnect_counts_[stream_id] = reconnects + 1;
       log_printf(LogLevel::Warn, "stream %u lost connection (%s), reconnecting (%u/%u)", stream_id,
                  message.c_str(), reconnects + 1, kMaxReconnects);
@@ -514,7 +605,9 @@ class ReplayRunner {
       return;
     }
     for (auto& client : live_clients_) client->close_after_flush();
-    watchdog_.expires_after(kFinishTimeout);
+    // Each client owns the same timeout for its FIN/EOF drain. Give it a small
+    // margin so a normal close wins over the global watchdog.
+    watchdog_.expires_after(options_.finish_timeout + std::chrono::seconds(1));
     watchdog_.async_wait(asio::bind_executor(strand_, [this](const ErrorCode& ec) {
       if (ec || completed_) return;
       fail("timed out waiting for pending writes to drain");
@@ -525,11 +618,11 @@ class ReplayRunner {
     if (completed_) return;
     const int64_t elapsed = now_monotonic_ns() - started_ns_;
     log_printf(LogLevel::Info,
-               "replay finished: %llu records, %llu data records, %s sent, %llu stream(s), "
-               "%llu connection(s), %llu skipped, %llu damaged file(s), %.3fs",
+               "replay finished: %llu records, %llu data records, %s sent, %s received, "
+               "%llu stream(s), %llu connection(s), %llu skipped, %llu damaged file(s), %.3fs",
                static_cast<unsigned long long>(records_read_),
                static_cast<unsigned long long>(data_records_),
-               format_bytes(bytes_replayed_).c_str(),
+               format_bytes(bytes_replayed_).c_str(), format_bytes(bytes_received_).c_str(),
                static_cast<unsigned long long>(streams_created_),
                static_cast<unsigned long long>(stream_connects_),
                static_cast<unsigned long long>(skipped_data_),
@@ -572,6 +665,10 @@ class ReplayRunner {
   size_t valid_files_ = 0;
   CaptureReader reader_;
   bool file_has_trailer_ = false;
+  bool have_chunk_index_ = false;
+  uint32_t last_chunk_index_ = 0;
+  bool large_gap_warned_ = false;
+  int64_t warned_gap_ns_ = 0;
   bool have_session_ = false;
   std::array<uint8_t, 16> session_uuid_{};
   rec::Framing session_framing_ = rec::Framing::VarintLength;
@@ -602,6 +699,7 @@ class ReplayRunner {
   uint64_t data_records_ = 0;
   uint64_t skipped_data_ = 0;
   uint64_t bytes_replayed_ = 0;
+  uint64_t bytes_received_ = 0;
   uint64_t stream_connects_ = 0;
   uint64_t streams_created_ = 0;
   uint64_t damaged_files_ = 0;

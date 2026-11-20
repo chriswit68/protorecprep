@@ -10,3 +10,4 @@ recordings/
 __pycache__/
 *.pyc
 protorecprep.tar
+tests/replay_test/broken_connection/

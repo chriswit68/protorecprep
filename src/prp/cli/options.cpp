@@ -640,6 +640,8 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       if (!need_duration(out.retry_interval)) return false;
     } else if (key == "--max-gap") {
       if (!need_duration(out.max_gap)) return false;
+    } else if (key == "--finish-timeout") {
+      if (!need_duration(out.finish_timeout)) return false;
     } else if (key == "--progress") {
       std::string text;
       if (!need_value(text)) return false;
@@ -866,6 +868,10 @@ bool parse_options(int argc, char** argv, Options& out, std::string& err) {
       err = "--retry-interval and --max-gap must not be negative";
       return false;
     }
+    if (out.finish_timeout.count() <= 0) {
+      err = "--finish-timeout must be > 0";
+      return false;
+    }
     // --truncate is an inspect-only repair flag; silently accepting it during
     // replay would be misleading.
     if (out.truncate_damaged) {
@@ -951,6 +957,7 @@ void print_help() {
       "  --retry-interval <dur>      Delay between connect attempts (default 1s)\n"
       "  --reconnect                 Resume after a mid-stream connection loss\n"
       "  --max-gap <dur>             Cap idle gaps between records (default off)\n"
+       "  --finish-timeout <dur>      Max wait for pending writes at the end (default 30s)\n"
       "  --progress <mode>           Per-file progress on stderr: auto|line|inline|off\n"
       "                              (default auto: in-place on a terminal, plain lines\n"
       "                              otherwise, e.g. in containers and CI)\n"

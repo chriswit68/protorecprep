@@ -463,6 +463,7 @@ Bei Typed-Framing wird die Typ-ID über die Rückrichtung der `type_map`
 | `--retry-interval <dur>` | `1s` | Pause zwischen Verbindungsversuchen |
 | `--reconnect` | `false` | Nach Verbindungsabbruch mitten im Stream fortsetzen |
 | `--max-gap <dur>` | aus | Maximale Pause zwischen Datensätzen begrenzen |
+| `--finish-timeout <dur>` | `30s` | Maximale Wartezeit auf ausstehende Schreibvorgänge und auf den `EOF` nach dem `FIN` am Stream-Ende |
 | `--progress <mode>` | `auto` | Fortschritt auf `stderr`: `auto` (Terminal in-place, sonst Logzeilen), `line`, `inline`, `off` |
 | `--strict` | `false` | Beschädigte Captures/Schema-Mismatch als fatal behandeln |
 | `--io-threads <n>` | automatisch | Anzahl der IO-Threads |
@@ -487,6 +488,16 @@ Log-Sammler wie Docker Compose `\r`-Updates erst am Dateiende sichtbar machen.
 `--progress line` erzwingt diese Ausgabe, `--progress inline` erzwingt die
 In-Place-Zeile, `--progress off` deaktiviert den Fortschritt. Der Prozentwert
 bezieht sich auf die Gesamtgröße der jeweiligen Datei.
+
+Replay liest Antworten des Zielservers mit und verwirft sie. Dadurch können
+sich keine TCP-Puffer füllen, und ein Verbindungsabbruch des Servers wird auch
+während einer Pause sofort erkannt. Beim `StreamClose` sendet Replay zuerst ein
+`FIN`, liest weitere Antworten noch zu Ende und schließt erst nach dem `EOF`
+des Servers. So entsteht kein TCP-`RST`, den ein Server sonst als „Verbindung
+wurde vom Remotehost geschlossen“ protokollieren würde. Die maximale Wartezeit
+dafür beträgt `--finish-timeout` (Standard `30s`). Große aufgezeichnete Lücken
+und Lücken in der Chunk-Nummerierung werden auf `stderr` gewarnt; das Timing
+bleibt dabei unverändert (mit `--max-gap` können große Pausen begrenzt werden).
 
 ### Passthrough-Optionen
 

@@ -24,6 +24,7 @@ ClientConnection::ClientConnection(asio::any_io_executor executor, ClientConfig 
       socket_(executor_),
       connect_timer_(executor_),
       retry_timer_(executor_),
+      close_timer_(executor_),
       read_buffer_(config_.read_buffer < 4096 ? 4096 : config_.read_buffer) {}
 
 void ClientConnection::start() {
@@ -41,10 +42,15 @@ void ClientConnection::restart() {
   if (!started_ || closed_ || connected_) return;
   failed_ = false;
   io_error_reported_ = false;
+  // A failed connection may have been mid-flush. The resumed attempt must
+  // continue draining the queue instead of closing it again on the next write.
+  close_requested_ = false;
   ++attempt_id_;  // invalidate callbacks from the previous attempt
   ErrorCode ignored;
   connect_timer_.cancel();
   retry_timer_.cancel();
+  close_timer_.cancel();
+  close_phase_ = ClosePhase::None;
   socket_.close(ignored);
   attempts_left_ = config_.connect_retries;
   do_connect();
@@ -62,7 +68,7 @@ void ClientConnection::close_after_flush() {
   close_requested_ = true;
   if (writing_) return;
   if (queue_.empty()) {
-    finish_close();
+    begin_close_drain();
     return;
   }
   // Still connecting: keep the attempt alive so the queued bytes can drain.
@@ -76,6 +82,8 @@ void ClientConnection::abort() {
   ErrorCode ignored;
   connect_timer_.cancel();
   retry_timer_.cancel();
+  close_timer_.cancel();
+  close_phase_ = ClosePhase::Done;
   socket_.close(ignored);
   connected_ = false;
   writing_ = false;
@@ -230,7 +238,7 @@ void ClientConnection::on_write(const ErrorCode& ec, size_t transferred) {
 
   if (queue_.empty()) {
     notify(drained_cb_);
-    if (close_requested_) finish_close();
+    if (close_requested_) begin_close_drain();
     return;
   }
   do_write();
@@ -251,9 +259,22 @@ void ClientConnection::on_read(const ErrorCode& ec, size_t transferred) {
   if (closed_) return;
 
   if (ec) {
+    if (close_phase_ == ClosePhase::WriteShutdown) {
+      // We already sent FIN and were only draining trailing responses. Any
+      // terminal read result means the peer is done; close without surfacing
+      // an error so the owner sees a regular close.
+      close_timer_.cancel();
+      finish_close();
+      return;
+    }
     if (ec == asio::error::operation_aborted) {
       // A restart closes the socket; re-arm on the new connection if needed.
       if (read_requested_ && connected_ && !read_paused_) do_read();
+      return;
+    }
+    if (ec == asio::error::eof) {
+      report_io_error("connection to " + config_.host + ":" + std::to_string(config_.port) +
+                      " closed by server");
       return;
     }
     report_io_error("read from " + config_.host + ":" + std::to_string(config_.port) +
@@ -278,6 +299,14 @@ void ClientConnection::on_read(const ErrorCode& ec, size_t transferred) {
 
 void ClientConnection::report_io_error(const std::string& message) {
   if (closed_ || io_error_reported_) return;
+  // Errors on a connection we are already tearing down are expected: the
+  // server may reset while we flush the last queued bytes after a StreamClose.
+  // Finish the close silently so the owner can release the client.
+  if (close_requested_) {
+    close_timer_.cancel();
+    finish_close();
+    return;
+  }
   io_error_reported_ = true;
   failed_ = true;
   connected_ = false;
@@ -286,9 +315,35 @@ void ClientConnection::report_io_error(const std::string& message) {
   notify_error(message);
 }
 
+void ClientConnection::begin_close_drain() {
+  if (closed_ || close_phase_ != ClosePhase::None) return;
+  // Without an active read side we cannot know when the peer's trailing
+  // responses have been consumed; keep the old immediate-close behavior.
+  if (!connected_ || !read_requested_ || read_paused_ || config_.close_timeout.count() <= 0) {
+    finish_close();
+    return;
+  }
+
+  close_phase_ = ClosePhase::WriteShutdown;
+  ErrorCode ignored;
+  // FIN on the write side only. Reading stays active so trailing ACKs are
+  // consumed; closing with unread data would make the OS emit a TCP RST.
+  socket_.shutdown(tcp::socket::shutdown_send, ignored);
+
+  close_timer_.expires_after(config_.close_timeout);
+  auto self = shared_from_this();
+  close_timer_.async_wait(asio::bind_executor(executor_, [self](const ErrorCode& ec) {
+    if (ec || self->closed_ || self->close_phase_ != ClosePhase::WriteShutdown) return;
+    self->finish_close();
+  }));
+
+  if (!reading_) do_read();
+}
+
 void ClientConnection::finish_close() {
   if (closed_) return;
   closed_ = true;
+  close_phase_ = ClosePhase::Done;
   connected_ = false;
   writing_ = false;
   reading_ = false;
@@ -298,6 +353,7 @@ void ClientConnection::finish_close() {
   ErrorCode ignored;
   connect_timer_.cancel();
   retry_timer_.cancel();
+  close_timer_.cancel();
   socket_.shutdown(tcp::socket::shutdown_both, ignored);
   socket_.close(ignored);
   log_printf(LogLevel::Debug, "connection to %s:%u closed", config_.host.c_str(),

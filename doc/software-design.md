@@ -452,7 +452,12 @@ Der `ReplayRunner` liest die Capture-Dateien sequenziell, rekonstruiert eine
 monotone Timeline aus den aufgezeichneten Wall-Clock-Zeitstempeln und sendet
 Datenrecords über je eine `ClientConnection` pro Stream. Backpressure verhindert
 unbegrenztes Vorauslesen; beschädigte Dateien werden standardmäßig als gültiges
-Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch. Während des
+Präfix abgespielt, im `--strict`-Modus führen sie zum Abbruch. Die Clients
+lesen Ziel-Antworten mit und verwerfen sie, damit TCP-Puffer nicht volllaufen
+und ein Peer-Close auch während langer Pausen auffällt. Beim Stream-Ende senden
+sie ein `FIN`, leeren die Leseseite bis zum `EOF` des Servers und schließen erst
+danach; das verhindert ein TCP-`RST` durch ungelesene Reste. Große Zeitlücken und
+fehlende Chunk-Nummern werden gewarnt, ohne das Timing zu verändern. Während des
 Abspielens meldet der Runner den Fortschritt auf `stderr`: den Pfad der
 aktuellen Capture-Datei und den prozentualen Lese-Fortschritt
 (`CaptureReader::bytes_consumed() / file_size()`), bei mehreren Chunks ergänzt
@@ -666,20 +671,28 @@ Reconnect, Fortschrittsformatierung und Netzwerk bleiben in
 - **Invarianten:** Pro aufgezeichnetem Stream höchstens eine aktive
   `ClientConnection`; Pacing wird nach Rückstau neu synchronisiert; Records
   ohne Wall-Clock-Zeitstempel (`ts_ns <= 0`) verändern die Timeline nicht;
-  beim Abschluss wird auf das Leeren aller Queues gewartet (Watchdog 30 s).
+  beim Abschluss wird auf das Leeren aller Queues gewartet
+  (`--finish-timeout`, Standard 30 s); derselbe Wert gilt pro Stream für das
+  Warten auf den `EOF` nach dem `FIN`. Der globale Watchdog erhält 1 s Margin,
+  damit der reguläre Client-Close zuerst abschließt. Große Pausen und fehlende
+  Chunks erzeugen Warnungen, ändern das Timing aber nicht.
 - **Threading:** Alle Zustandsänderungen erfolgen auf dem Runner-Strand.
 
 #### `ClientConnection` (`prp::ClientConnection`)
 
 - **Verantwortung:** Asynchroner TCP-Client für Replay und Passthrough.
-- **Zustand:** Socket, Resolver, Connect-/Retry-Timer, Write-Queue,
-  Read-Puffer, Callbacks, Verbindungszähler, Flags.
+- **Zustand:** Socket, Resolver, Connect-/Retry-/Close-Timer, Close-Phase,
+  Write-Queue, Read-Puffer, Callbacks, Verbindungszähler, Flags.
 - **Wichtige Methoden:** `start()`, `restart()`, `write()`,
-  `close_after_flush()`, `abort()`, `start_reading()`, `pause_reads()`,
-  `resume_reads()`.
-- **Invarianten:** Lesen ist opt-in; Replay liest nie; alle Callbacks werden
-  auf dem übergebenen Executor ausgeführt; `queued_bytes()` begrenzt den
-  Speicher.
+  `close_after_flush()`, `begin_close_drain()`, `abort()`, `start_reading()`,
+  `pause_reads()`, `resume_reads()`.
+- **Invarianten:** Lesen ist opt-in; Replay liest, um Ziel-Antworten zu
+  verwerfen und Peer-Closes früh zu erkennen; Passthrough leitet sie weiter;
+  `close_after_flush()` sendet bei aktiver Leseseite nur `SHUT_WR`, draint bis
+  zum Peer-`EOF` oder zum `close_timeout` und schließt erst dann, damit keine
+  ungelesenen Daten einen `RST` auslösen; ohne Leseseite bleibt der direkte
+  Close erhalten; alle Callbacks werden auf dem übergebenen Executor
+  ausgeführt; `queued_bytes()` begrenzt den Speicher.
 - **Threading:** Public-Methoden müssen auf dem Executor laufen.
 
 #### `SessionForwarder` (`prp::SessionForwarder`)
@@ -1112,8 +1125,11 @@ sequenceDiagram
     alt Data und Richtung ausgewählt
       RR->>CC: write(payload)
       CC->>T: TCP
+      T-->>CC: Antworten (vom Replay verworfen)
     else StreamClose
       RR->>CC: close_after_flush()
+      CC->>T: FIN
+      T-->>CC: EOF (Restantworten verworfen)
     else andere Records
       RR->>RR: Metadaten/Ignorieren
     end
@@ -1122,7 +1138,9 @@ sequenceDiagram
     end
   end
   RR->>CC: close_after_flush für alle
-  RR->>RR: Watchdog 30 s, dann Exit
+  CC->>T: FIN
+  T-->>CC: EOF
+  RR->>RR: Watchdog finish-timeout + 1 s, dann Exit
 ```
 
 Während der Schleife meldet der Runner den Fortschritt auf `stderr`: voller
@@ -1145,6 +1163,8 @@ Pacing-Regeln:
   Pacing ignoriert.
 - Bei Rückstau wird die Timeline auf „jetzt“ gesetzt, damit kein Burst
   entsteht.
+- Skalierte Pausen ab 10 s und Lücken in der Chunk-Nummerierung lösen eine
+  Warnung aus (`--max-gap` begrenzt Pausen optional).
 - Gesamt-High-Water: 64 MiB; pro Stream: 256 MiB.
 
 ### 6.9 Entscheidungsbaum: Overflow-Politik

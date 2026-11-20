@@ -95,6 +95,8 @@ struct Options {
   double replay_speed = 1.0;  // 1.0 = realtime, 0 = as fast as possible
   ReplayDirection replay_direction = ReplayDirection::In;
   std::chrono::milliseconds max_gap{0};
+  // How long replay waits for pending writes at the end before giving up.
+  std::chrono::milliseconds finish_timeout{30000};
   bool strict = false;
   ProgressMode progress = ProgressMode::Auto;
   bool progress_set = false;
