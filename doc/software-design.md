@@ -1471,9 +1471,14 @@ erlaubt.
 |------|-------------|
 | `unit` | Queue, CRC32C, Recorder/Reader inkl. `ILogger`-Zustellung, Options, Framing, Namenshelfer, JSON/Blob, Chunkrotation, Observer |
 | `integration` | Record mit Varint, JSONL-Chunks, `segment`-Feld, Einzeldatei-Modus, Chunking |
-| `replay` | Byte-genaues Replay, Pacing, Richtungen, Fehlerfälle |
+| `replay` | Byte-genaues Replay, Pacing, Richtungen, Fehlerfälle, synthetische Aufzeichnungslücken (Sekunden bis Stunden) |
 | `passthrough` | Beide Richtungen inkl. Aufzeichnung und JSON-Chunks |
 | `typed` | 8-Byte-Header, Typ-Map, unbekannte IDs, Blobs, JSON-Chunks |
+
+Die E2E-Tests erzeugen ihre Captures zur Laufzeit in temporären Verzeichnissen
+über Loopback; `PRP_KEEP_TEST_ARTIFACTS=1` behält die Artefakte zum Debuggen.
+Der Lücken-Test schreibt minimale `.pcr`-Chunks mit Zeitstempeln von Sekunden bis
+Stunden direkt in den Test, statt externe Aufnahmen zu verwenden.
 
 Zusätzlich: reale Referenzdaten in `tests/events.jsonl`, Benchmark über
 `bench/benchmark.py`, Sanitizer-Presets (`asan`, `tsan`). Der Unit-Test

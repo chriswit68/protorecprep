@@ -751,7 +751,7 @@ ctest --test-dir build/default --output-on-failure
 |------|--------|
 | `unit` | Queue, CRC32C, Recorder/Reader inkl. `ILogger`, Options, Framing, JSON- und Blob-Konvertierung |
 | `integration` | Record-Modus mit Varint-Framing, JSONL und Chunking |
-| `replay` | Byte-genaues Replay, Pacing, Richtungen und Fehlerfälle |
+| `replay` | Byte-genaues Replay, Pacing, Richtungen, Fehlerfälle und synthetische Aufzeichnungslücken (Sekunden bis Stunden) |
 | `passthrough` | Live-Weiterleitung in beide Richtungen inkl. Aufzeichnung |
 | `typed` | 8-Byte-Header, Typ-Map, unbekannte IDs, Passthrough und `@file`-Blobs |
 
@@ -761,6 +761,12 @@ Einzelne Python-Tests lassen sich auch direkt starten:
 python3 tests/typed_test.py build/default/protorecprep proto/sample.proto
 python3 tests/integration_test.py build/default/protorecprep proto/sample.proto
 ```
+
+Die E2E-Tests erzeugen ihre Captures zur Laufzeit in temporären Verzeichnissen
+und benötigen keine externen Aufnahmen. Der Lücken-Test schreibt minimale
+`.pcr`-Chunks mit Zeitstempeln von wenigen Sekunden bis mehreren Stunden, um
+Pacing und Reconnect ohne langes Warten zu prüfen. Mit
+`PRP_KEEP_TEST_ARTIFACTS=1` bleiben die erzeugten Dateien zum Debuggen liegen.
 
 `tests/events.jsonl` ist eine reale Referenzaufnahme mit 103 Blob-Frames
 (59 pcap, 32 wav, 12 Text) und dient zur Gegenprüfung der Blob-Extraktion.
