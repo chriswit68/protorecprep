@@ -3,8 +3,8 @@
 
 The tests record schema-free raw byte streams with the real binary, replay the
 resulting captures into a local sink server and compare the received bytes.
-They also cover multi-chunk sessions, pacing, unreachable targets, damaged
-capture tails and direction filtering.
+They also cover multi-chunk sessions, pacing, long recorded gaps, unreachable
+targets, damaged capture tails and direction filtering.
 """
 
 import os
@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -277,6 +278,59 @@ def progress_lines(stderr: str) -> list[str]:
         for line in stderr.split("\n")
         if re.fullmatch(r"(\[\d+/\d+\] )?\S+\.pcr\s+\d+%", line)
     ]
+
+
+def _crc32c(data: bytes) -> int:
+    """CRC32C (reflected Castagnoli), matching lib/protorecrep's crc32c()."""
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFF
+
+
+def _pcr_record(record_type: int, payload: bytes) -> bytes:
+    return struct.pack("<BII", record_type, len(payload), _crc32c(payload)) + payload
+
+
+def _stream_open_payload(stream_id: int, ts_ns: int, peer: bytes, type_name: bytes) -> bytes:
+    return struct.pack("<IqHH", stream_id, ts_ns, len(peer), len(type_name)) + peer + type_name
+
+
+def _data_payload(stream_id: int, direction: int, ts_ns: int, data: bytes) -> bytes:
+    return struct.pack("<IB3xq", stream_id, direction, ts_ns) + data
+
+
+def _stream_close_payload(stream_id: int, ts_ns: int) -> bytes:
+    return struct.pack("<IB3xq", stream_id, 0, ts_ns)
+
+
+def _trailer_payload(records: int, bytes_count: int, ts_ns: int) -> bytes:
+    return struct.pack("<QQB3xq", records, bytes_count, 1, ts_ns)
+
+
+def _write_gap_capture(path: str, session_uuid: bytes, start_ns: int,
+                       records: list[tuple[int, bytes]]) -> None:
+    """Writes a minimal raw-framing .pcr chunk with caller-provided timestamps.
+
+    The layout mirrors lib/protorecrep/src/format.cpp: an 80-byte file header
+    (76 fixed bytes plus the CRC) followed by length/CRC-prefixed records.
+    """
+    fixed = (
+        b"PCRP"
+        + struct.pack("<HHI", 1, 0, 80)
+        + session_uuid
+        + b"\x00" * 4            # framing=raw plus padding
+        + struct.pack("<q", start_ns)
+        + bytes(32)              # proto digest (schema checking is not used here)
+        + struct.pack("<I", 0)   # descriptor length
+    )
+    check(len(fixed) == 76, f"unexpected .pcr header size: {len(fixed)}")
+    with open(path, "wb") as fh:
+        fh.write(fixed + struct.pack("<I", _crc32c(fixed)))
+        for record_type, payload in records:
+            fh.write(_pcr_record(record_type, payload))
 
 
 def replay_to_sink(
@@ -828,6 +882,152 @@ def test_graceful_stream_close(binary: str, workdir: str) -> None:
     check(result.returncode == 0, f"graceful close replay failed: {result.stderr}")
 
 
+def test_long_recorded_gaps(binary: str, workdir: str) -> None:
+    """Replays synthetic chunks whose timestamps span seconds up to hours.
+
+    No real time may pass for the recorded gaps unless pacing is requested,
+    and a target that closes while replay waits out a gap must not lose data.
+    """
+    check(_crc32c(b"123456789") == 0xE3069283, "CRC32C helper does not match the capture format")
+
+    gap_dir = os.path.join(workdir, "long-gaps")
+    os.makedirs(gap_dir, exist_ok=True)
+    session_uuid = bytes(range(16))
+    base_ns = 1_700_000_000_000_000_000
+    stream_id = 7
+    open_record, data_record, close_record, trailer_record = 1, 2, 3, 5
+
+    def ts(seconds: int) -> int:
+        return base_ns + seconds * 1_000_000_000
+
+    first = b"chunk-1-a" + b"chunk-1-b"
+    rest = b"chunk-25" + b"chunk-26" + b"chunk-27"
+    expected = first + rest
+
+    t_chunk1 = 0
+    t_chunk25 = 2 + 23 * 3600        # 23 h gap after chunk 1
+    t_chunk26 = t_chunk25 + 2 * 3600 + 45
+    t_chunk27 = t_chunk26 + 3600
+
+    _write_gap_capture(
+        os.path.join(gap_dir, "capture-000001.pcr"), session_uuid, base_ns,
+        [
+            (open_record, _stream_open_payload(stream_id, ts(t_chunk1), b"127.0.0.1:1", b"")),
+            (data_record, _data_payload(stream_id, 0, ts(t_chunk1), b"chunk-1-a")),
+            (data_record, _data_payload(stream_id, 0, ts(t_chunk1 + 2), b"chunk-1-b")),
+            (trailer_record, _trailer_payload(3, len(first), ts(t_chunk1 + 2))),
+        ],
+    )
+    _write_gap_capture(
+        os.path.join(gap_dir, "capture-000025.pcr"), session_uuid, base_ns,
+        [
+            (data_record, _data_payload(stream_id, 0, ts(t_chunk25), b"chunk-25")),
+            (trailer_record, _trailer_payload(1, 8, ts(t_chunk25))),
+        ],
+    )
+    _write_gap_capture(
+        os.path.join(gap_dir, "capture-000026.pcr"), session_uuid, base_ns,
+        [
+            (data_record, _data_payload(stream_id, 0, ts(t_chunk26), b"chunk-26")),
+            (trailer_record, _trailer_payload(1, 8, ts(t_chunk26))),
+        ],
+    )
+    _write_gap_capture(
+        os.path.join(gap_dir, "capture-000027.pcr"), session_uuid, base_ns,
+        [
+            (data_record, _data_payload(stream_id, 0, ts(t_chunk27), b"chunk-27")),
+            (close_record, _stream_close_payload(stream_id, ts(t_chunk27))),
+            (trailer_record, _trailer_payload(2, 8, ts(t_chunk27))),
+        ],
+    )
+
+    # At max speed the recorded timeline is irrelevant: all bytes arrive in
+    # one connection, and the missing chunk numbers are reported.
+    received, result, connections = replay_to_sink(
+        binary, ["--dir", gap_dir], ["--speed", "0", "--direction", "in", "--log-level", "warn"]
+    )
+    check(result.returncode == 0, f"max-speed gap replay failed: {result.stderr}")
+    check(connections == 1, f"expected one replay connection, got {connections}")
+    check(received == expected, f"gap replay byte mismatch: got {len(received)}, expected {len(expected)}")
+    check("capture chunks 2..24 are missing" in result.stderr,
+          f"missing chunk warning absent: {result.stderr}")
+
+    # With pacing enabled, --max-gap must keep the multi-hour waits short.
+    sink = SinkServer()
+    start = time.monotonic()
+    try:
+        result = run_replay(
+            binary,
+            [
+                "--dir", gap_dir,
+                "--target", f"127.0.0.1:{sink.port}",
+                "--speed", "1",
+                "--max-gap", "150ms",
+                "--direction", "in",
+                "--log-level", "warn",
+            ],
+            timeout=15.0,
+        )
+        time.sleep(0.1)
+        received = sink.data()
+    finally:
+        sink.close()
+    elapsed = time.monotonic() - start
+    check(result.returncode == 0, f"paced gap replay failed: {result.stderr}")
+    check(received == expected, f"paced gap replay byte mismatch: got {len(received)} bytes")
+    check(elapsed < 5.0, f"hours-long gaps were not capped by --max-gap: {elapsed:.2f}s")
+
+    # A target closing during the long pause must not abort the replay with
+    # --reconnect: the next record simply opens a fresh connection.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(20.0)
+    connections_data: list[bytes] = []
+
+    def serve() -> None:
+        for index in range(2):
+            conn, _ = listener.accept()
+            conn.settimeout(10.0)
+            data = bytearray()
+            try:
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if index == 0 and len(data) >= len(first):
+                        break  # close while replay is waiting out the 23 h gap
+            finally:
+                connections_data.append(bytes(data))
+                conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        result = run_replay(
+            binary,
+            [
+                "--dir", gap_dir,
+                "--target", f"127.0.0.1:{listener.getsockname()[1]}",
+                "--speed", "1",
+                "--max-gap", "150ms",
+                "--reconnect",
+                "--direction", "in",
+                "--log-level", "warn",
+            ],
+            timeout=20.0,
+        )
+    finally:
+        thread.join(timeout=5.0)
+        listener.close()
+
+    check(result.returncode == 0, f"replay after gap-time close failed: {result.stderr}")
+    check(connections_data == [first, rest],
+          f"unexpected connection payloads after idle close: {connections_data}")
+
+
 def test_missing_chunk_warning(binary: str, workdir: str) -> None:
     """A hole in the chunk numbering must be reported as a recorded pause."""
     out_dir = os.path.join(workdir, "chunk-gap-source")
@@ -868,6 +1068,7 @@ def main() -> int:
         test_target_responses_drained(binary, workdir)
         test_graceful_stream_close(binary, workdir)
         test_missing_chunk_warning(binary, workdir)
+        test_long_recorded_gaps(binary, workdir)
         if not os.environ.get("PRP_SKIP_PROTO_TESTS"):
             test_proto_validation(binary, proto, workdir)
         print("replay integration test passed")
