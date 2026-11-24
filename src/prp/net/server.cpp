@@ -17,6 +17,7 @@
 
 #include "prp/lib.h"
 #include "prp/net/framer.h"
+#include "prp/net/session_lifecycle.h"
 #include "prp/util/log.h"
 
 namespace prp {
@@ -67,12 +68,12 @@ class Session : public std::enable_shared_from_this<Session> {
       });
     }
     asio::post(strand_, [self] {
-      if (self->closing_) return;
+      if (self->lifecycle_.closing()) return;
       self->opened_ns_ = now_wall_ns();
-      self->started_ = true;
+      self->lifecycle_.mark_started();
       self->submit(make_stream_open(self->id_, self->opened_ns_, self->peer_string(),
                                     self->open_type_name_));
-      if (self->closing_) return;
+      if (self->lifecycle_.closing()) return;
       self->arm_idle_timer();
       self->schedule_sends();
       self->do_read();
@@ -107,7 +108,7 @@ class Session : public std::enable_shared_from_this<Session> {
   }
 
   void do_read() {
-    if (closing_) return;
+    if (lifecycle_.closing()) return;
     auto self = shared_from_this();
     socket_.async_read_some(
         asio::buffer(read_buffer_), asio::bind_executor(strand_, [self](const ErrorCode& ec, size_t n) {
@@ -116,7 +117,7 @@ class Session : public std::enable_shared_from_this<Session> {
   }
 
   void on_read(const ErrorCode& ec, size_t n) {
-    if (closing_) return;
+    if (lifecycle_.closing()) return;
     if (ec) {
       if (ec == asio::error::eof || ec == asio::error::connection_reset) {
         do_close(CloseReason::PeerClosed);
@@ -143,7 +144,7 @@ class Session : public std::enable_shared_from_this<Session> {
       submit(make_data(id_, Direction::In, now_wall_ns(), std::move(bytes),
                        server_.config().default_type_name));
     }
-    if (closing_) return;
+    if (lifecycle_.closing()) return;
 
     // Forward the raw inbound bytes before framing validation. Forwarding never
     // includes locally generated outbound messages.
@@ -164,7 +165,7 @@ class Session : public std::enable_shared_from_this<Session> {
     // callback resumes reading, so no bytes are dropped.
     if (forwarder_ && forwarder_->active() &&
         forwarder_->queued_bytes() >= server_.config().forward.queue_limit) {
-      paused_ = true;
+      lifecycle_.pause_reads();
       idle_timer_.cancel();
       return;
     }
@@ -200,20 +201,20 @@ class Session : public std::enable_shared_from_this<Session> {
 
   void schedule_every() {
     const SendSpec& spec = server_.config().send;
-    if (closing_ || spec.every.count() <= 0) return;
+    if (lifecycle_.closing() || spec.every.count() <= 0) return;
     if (spec.count > 0 && sent_count_ >= spec.count) return;
     auto self = shared_from_this();
     every_timer_.expires_after(spec.every);
     every_timer_.async_wait(asio::bind_executor(strand_, [self](const ErrorCode& ec) {
       if (ec) return;
-      if (self->closing_) return;
+      if (self->lifecycle_.closing()) return;
       self->send_message();
       self->schedule_every();
     }));
   }
 
   void send_message() {
-    if (closing_) return;
+    if (lifecycle_.closing()) return;
     const SendSpec& spec = server_.config().send;
     if (!spec.enabled || spec.framed_bytes.empty()) return;
     if (spec.count > 0 && sent_count_ >= spec.count) return;
@@ -233,7 +234,7 @@ class Session : public std::enable_shared_from_this<Session> {
     {
       std::vector<uint8_t> copy(spec.framed_bytes.begin(), spec.framed_bytes.end());
       submit(make_data(id_, Direction::Out, now_wall_ns(), std::move(copy), spec.type_name));
-      if (closing_) return;
+      if (lifecycle_.closing()) return;
     }
 
     write_queue_bytes_ += spec.framed_bytes.size();
@@ -242,7 +243,7 @@ class Session : public std::enable_shared_from_this<Session> {
   }
 
   void do_write() {
-    if (closing_ || write_in_progress_ || write_queue_.empty()) return;
+    if (lifecycle_.closing() || write_in_progress_ || write_queue_.empty()) return;
     write_in_progress_ = true;
     auto self = shared_from_this();
     socket_.async_write_some(asio::buffer(write_queue_.front()),
@@ -253,7 +254,7 @@ class Session : public std::enable_shared_from_this<Session> {
 
   void on_write(const ErrorCode& ec, size_t n) {
     write_in_progress_ = false;
-    if (closing_) return;
+    if (lifecycle_.closing()) return;
     if (ec) {
       log_printf(LogLevel::Debug, "stream %u write error: %s", id_, ec.message().c_str());
       do_close(CloseReason::SendError);
@@ -277,7 +278,7 @@ class Session : public std::enable_shared_from_this<Session> {
   }
 
   void on_response(std::vector<uint8_t> bytes) {
-    if (closing_ || bytes.empty()) return;
+    if (lifecycle_.closing() || bytes.empty()) return;
 
     // Queue the bytes for the client first, then record a copy. The write
     // queue holds payloads as strings; the capture item takes the buffer.
@@ -286,7 +287,7 @@ class Session : public std::enable_shared_from_this<Session> {
     write_queue_.push_back(std::move(queued));
     submit(make_data(id_, Direction::Out, now_wall_ns(), std::move(bytes),
                      server_.config().default_type_name));
-    if (closing_) return;
+    if (lifecycle_.closing()) return;
     do_write();
 
     // Backpressure on the target while the client backlog is full: pause
@@ -297,8 +298,7 @@ class Session : public std::enable_shared_from_this<Session> {
   }
 
   void do_close(CloseReason reason) {
-    if (closing_) return;
-    closing_ = true;
+    if (!lifecycle_.begin_close()) return;
 
     ErrorCode ec;
     idle_timer_.cancel();
@@ -307,7 +307,7 @@ class Session : public std::enable_shared_from_this<Session> {
     socket_.shutdown(tcp::socket::shutdown_both, ec);
     socket_.close(ec);
 
-    if (started_) {
+    if (lifecycle_.started()) {
       submit(make_stream_close(id_, reason, now_wall_ns()));
     }
     log_printf(LogLevel::Debug, "stream %u closed (%s)", id_, close_reason_name(reason));
@@ -329,14 +329,14 @@ class Session : public std::enable_shared_from_this<Session> {
   }
 
   void on_forward_drained() {
-    if (closing_ || !paused_) return;
-    paused_ = false;
+    if (lifecycle_.closing() || !lifecycle_.paused()) return;
+    lifecycle_.resume_reads();
     arm_idle_timer();
     do_read();
   }
 
   void on_forward_error() {
-    if (closing_) return;
+    if (lifecycle_.closing()) return;
     // With coupled connections the target failure also ends the client stream.
     // The client can reconnect, which opens a fresh target connection.
     if (server_.config().forward.link_connections) {
@@ -345,19 +345,19 @@ class Session : public std::enable_shared_from_this<Session> {
     }
     // Forwarding stopped, but recording continues. Release any backpressure
     // that was imposed by the forwarding queue.
-    if (!paused_) return;
-    paused_ = false;
+    if (!lifecycle_.paused()) return;
+    lifecycle_.resume_reads();
     arm_idle_timer();
     do_read();
   }
 
   void on_forward_closed() {
-    if (closing_) {
+    if (lifecycle_.closing()) {
       finalize();
       return;
     }
-    if (!paused_) return;
-    paused_ = false;
+    if (!lifecycle_.paused()) return;
+    lifecycle_.resume_reads();
     arm_idle_timer();
     do_read();
   }
@@ -367,7 +367,7 @@ class Session : public std::enable_shared_from_this<Session> {
     forward_watchdog_.expires_after(kFinishTimeout);
     auto self = shared_from_this();
     forward_watchdog_.async_wait(asio::bind_executor(strand_, [self](const ErrorCode& ec) {
-      if (ec || self->finalized_) return;
+      if (ec || self->lifecycle_.finalized()) return;
       log_printf(LogLevel::Warn, "stream %u: timed out flushing forward queue", self->id_);
       if (self->forwarder_) self->forwarder_->abort();
       self->finalize();
@@ -375,8 +375,7 @@ class Session : public std::enable_shared_from_this<Session> {
   }
 
   void finalize() {
-    if (finalized_) return;
-    finalized_ = true;
+    if (!lifecycle_.finalize()) return;
     forward_watchdog_.cancel();
     if (forwarder_) {
       server_.note_forward_result(forwarder_->started(), forwarder_->bytes_forwarded(),
@@ -399,15 +398,12 @@ class Session : public std::enable_shared_from_this<Session> {
   std::deque<std::string> write_queue_;
   size_t write_queue_bytes_ = 0;
   bool write_in_progress_ = false;
-  bool closing_ = false;
-  bool started_ = false;
+  SessionLifecycle lifecycle_;
   std::string open_type_name_;
   int64_t opened_ns_ = 0;
   uint64_t sent_count_ = 0;
   uint64_t dropped_sends_ = 0;
   std::shared_ptr<SessionForwarder> forwarder_;
-  bool paused_ = false;
-  bool finalized_ = false;
 };
 
 Server::Server(asio::io_context& io, ServerConfig config, Recorder& recorder)

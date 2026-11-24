@@ -59,7 +59,7 @@ struct CaptureRecord {
   uint32_t stream_id = 0;
   Direction dir = Direction::In;
   int64_t ts_ns = 0;
-  uint8_t close_reason = 0;
+  CloseReason close_reason = CloseReason::PeerClosed;
   std::string peer;
   std::string type_name;
   std::vector<uint8_t> data;

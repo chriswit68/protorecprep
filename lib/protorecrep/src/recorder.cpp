@@ -335,8 +335,7 @@ void Recorder::run() {
                                  item->data.size());
         break;
       case ItemKind::StreamClose:
-        rec::append_stream_close_payload(payload_, item->stream_id,
-                                         static_cast<CloseReason>(item->close_reason), item->ts_ns);
+        rec::append_stream_close_payload(payload_, item->stream_id, item->close_reason, item->ts_ns);
         active_streams_.erase(item->stream_id);
         break;
       case ItemKind::Marker:

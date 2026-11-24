@@ -4,9 +4,9 @@
 |------|------|
 | Projekt | `protorecprep` |
 | Dokumenttyp | Software-Design-Dokument nach arc42 |
-| Version | 1.1 |
-| Stand | 13. November 2026 |
-| Git-Stand | `25490b5` (plus lokale Änderungen am Bibliotheks-Refactoring) |
+| Version | 1.2 |
+| Stand | 24. November 2026 |
+| Git-Stand | `25490b5` (plus lokale Änderungen am Bibliotheks-Refactoring und an den App-Komponenten) |
 | Zielgruppe | Entwickler, Betreiber, Integratoren |
 | Sprache | Deutsch |
 
@@ -28,6 +28,12 @@ Seit Version 1.1 ist der speichernde und lesende Kern als eigenständige
 C++-Bibliothek `protorecrep` unter `lib/protorecrep/` abgetrennt. Die
 Anwendung `protorecprep` bindet sie ein und behält Netzwerk-, Protobuf-,
 JSON- und CLI-Logik.
+
+Seit Version 1.2 sind mehrere zuvor im `ReplayRunner`, `JsonWriter` und in der
+`Session` eingebettete Aufgaben eigene Komponenten: `ReplayTimeline`,
+`ProgressReporter`, `BlobInfo`/`analyze_blob()` und `SessionLifecycle`. Die
+Das Verhalten nach außen bleibt unverändert; Capture-Format, CLI und Wire-
+Protokoll sind nicht betroffen.
 
 ## Inhaltsverzeichnis
 
@@ -313,6 +319,7 @@ flowchart TB
 | S12 | **Konfiguration vor Laufzeit prüfen** | Fehler früh und klar melden | `validate_options()` vor dem Start; Exit-Code 2 |
 | S13 | **Betrieb als einzelnes Binary** | Einfacher Transport und Containerbetrieb | Keine externen Dienste; nur Dateisystem und TCP |
 | S14 | **Capture-Kern als eigenständige Bibliothek** | Speicher-/Leselogik unabhängig von Netzwerk und Protobuf wiederverwenden | `lib/protorecrep/`, Namespace `protorecrep`, statisches Target mit CMake-Export |
+| S15 | **Zustand und Aufgaben in kleine Komponenten zerlegen** | Unmögliche Zustände vermeiden und Orchestratoren testbar halten | `SessionLifecycle`, `ReplayTimeline`, `ProgressReporter`, `BlobInfo` statt Flag-Sammlungen und verteilter Helper |
 
 ### 4.3 Technologieentscheidungen im Überblick
 
@@ -343,6 +350,7 @@ flowchart TB
 | Einstieg/CLI | Argumente, INI, Hilfe, Validierung, Dispatch | `src/main.cpp`, `src/prp/cli/` |
 | Anwendungssteuerung | Start-/Shutdown-Reihenfolge, Metadaten, Summaries, Inspect | `src/prp/app/record_app.cpp` |
 | Netzwerk-Server | Accept, Verbindungslimit, Session-Lebenszyklus | `src/prp/net/server.cpp`, `server.h` |
+| Session-Lifecycle | Explizite Zustandsübergänge einer Verbindung | `src/prp/net/session_lifecycle.h` |
 | Framer | Inkrementelle Validierung und Reassembly | `src/prp/net/framer.cpp`, `framer.h` |
 | Bibliotheks-API | Öffentliche Capture-Typen, Konfiguration, `ILogger`, Umbrella-Header | `lib/protorecrep/include/protorecrep/` |
 | Recorder | Persistenz, CRC, Rotation, fsync, Statistik, `summary.json` | `lib/protorecrep/src/recorder.cpp`, `include/protorecrep/recorder.h` |
@@ -350,9 +358,12 @@ flowchart TB
 | Capture-Reader | Sequenzielles Lesen, Scan, Recovery | `lib/protorecrep/src/reader.cpp`, `include/protorecrep/reader.h` |
 | Library-Core | Items, Richtungen, Close-Gründe, bounded Queue | `lib/protorecrep/include/protorecrep/capture_item.h`, `queue.h` |
 | JSON-Sidecar | Dekodierung, Blob-Extraktion, JSONL-Chunks je Capture-Chunk | `src/prp/json/json_writer.cpp`, `json_writer.h` |
+| Blob-Analyse | Prefix-Entfernung, Magic-Erkennung, Dateiendung | `src/prp/json/blob.cpp`, `blob.h` |
 | Schema | `.proto` laden, Descriptor-Set, Digest | `src/prp/proto/schema.cpp`, `schema.h` |
 | Forwarding/Client | Asynchroner TCP-Client und Weiterleitung | `src/prp/net/client.cpp`, `forwarder.cpp` |
 | Replay | Timeline, Pacing, Reconnect, Validierung, Fortschrittsausgabe | `src/prp/replay/replay_app.cpp` |
+| Replay-Timeline | Monotone Zeitachse, Gap-Skalierung, Warnung bei großen Pausen | `src/prp/replay/timeline.cpp`, `timeline.h` |
+| Progress-Reporter | Modus, Drosselung und Ausgabe der Fortschrittszeile | `src/prp/replay/progress_reporter.cpp`, `progress_reporter.h` |
 | Utilities (Bibliothek) | CRC32C, SHA-256, Dateisystem-, Byte- und Texthelfer | `lib/protorecrep/src/util/` |
 | Utilities (App) | Logging (`AppLogger`), Base64 | `src/prp/util/` |
 | App-Aliase | Abbildung der `protorecrep`-Typen auf den Namespace `prp` | `src/prp/lib.h` |
@@ -414,7 +425,9 @@ nicht blockierende Queue. Bei Überlauf wird das Item verworfen, der betroffene
 Stream als desynchronisiert markiert und im JSONL dokumentiert. Die
 Binäraufnahme ist davon nicht betroffen. Im Typed-Framing löst der Writer
 jeden Frame über `type_map` bzw. `file_types` auf, dekodiert Protobuf oder
-extrahiert einen Blob.
+extrahiert einen Blob. Prefix-Entfernung, Magic-Erkennung und Dateiendung
+liefern `analyze_blob()` und `BlobInfo` aus `src/prp/json/blob.*`; das
+Schreiben der Datei und des JSONL-Events bleibt beim Writer.
 
 Ist `--json` aktiv, schreibt der Writer standardmäßig **einen JSONL-Chunk pro
 Capture-Chunk**. Der Recorder ist für die Chunk-Grenzen autoritativ: Nach
@@ -465,6 +478,11 @@ um `[i/N]`. Das Format hängt von `--progress` ab: im Terminal eine in-place
 aktualisierte Zeile, ohne Terminal vollständige, mit `\n` abgeschlossene
 Logzeilen (höchstens eine pro Sekunde), weil Docker-Compose und andere
 Log-Pipelines nur an `\n` trennen.
+
+`ReplayTimeline` und `ProgressReporter` kapseln diese beiden Querschnittsaufgaben.
+Der Runner reicht der Timeline die Zeitstempel der Records und dem Reporter die
+Position des Readers; Timer, Netzwerk und Chunk-Verwaltung bleiben beim Runner.
+Dadurch lassen sich Gap-Skalierung und Fortschrittslogik ohne Asio testen.
 
 Die Bibliothek stellt dafür nur `CaptureReader` mit `bytes_consumed()` und
 `file_size()` sowie die Scan-/Recovery-Funktionen bereit. Timeline, Pacing,
@@ -517,6 +535,16 @@ Reconnect, Fortschrittsformatierung und Netzwerk bleiben in
   `stream_close` genau einmal; nach `closing_` werden keine neuen Reads
   gestartet; lokal erzeugte Send-Nachrichten werden nicht weitergeleitet.
 - **Threading:** Alle Operationen werden über den Session-Strand serialisiert.
+
+#### `SessionLifecycle` (`prp::SessionLifecycle`)
+
+- **Verantwortung:** Zustandsübergänge genau einer Verbindung: gestartet,
+  schließend, Reads pausiert, finalisiert.
+- **Wichtige Methoden:** `mark_started()`, `begin_close()`, `pause_reads()`,
+  `resume_reads()`, `finalize()`.
+- **Invarianten:** `begin_close()` und `finalize()` liefern genau einmal `true`;
+  nach `begin_close()` dürfen Reads nicht mehr pausiert werden.
+- **Threading:** Wird ausschließlich auf dem Session-Strand benutzt.
 
 #### `Recorder` (`protorecrep::Recorder`, in der App als `prp::Recorder`)
 
@@ -574,8 +602,8 @@ Reconnect, Fortschrittsformatierung und Netzwerk bleiben in
 - **Verantwortung:** Unveränderliche Arbeitseinheit zwischen Netzwerk,
   Recorder und JSON-Writer.
 - **Zustand:** `ItemKind` (`StreamOpen`, `Data`, `StreamClose`, `Marker`),
-  `stream_id`, `Direction`, `ts_ns`, `close_reason`, `peer`, `type_name`,
-  `data`.
+  `stream_id`, `Direction`, `ts_ns`, `close_reason` (typisiert als `CloseReason`),
+  `peer`, `type_name`, `data`.
 - **Methoden:** `accounted_bytes()` (Payload-Größe inkl. Buchhaltung).
 - **Invarianten:** Nach dem Submit wird der Inhalt nicht mehr verändert;
   die letzte Freigabe erfolgt, wenn Recorder und JsonWriter fertig sind.
@@ -625,6 +653,17 @@ Reconnect, Fortschrittsformatierung und Netzwerk bleiben in
   `"segment": N`.
 - **Threading:** Public `submit()` ist thread-safe; die gesamte Dekodierung
   läuft im Worker-Thread.
+
+#### `BlobInfo` / `analyze_blob()` (`prp`)
+
+- **Verantwortung:** Einen Blob-Payload analysieren: optionales `u32-LE`-Prefix
+  entfernen, Magic erkennen und die Dateiendung ableiten.
+- **Zustand:** `data` (Payload ohne Prefix), `kind`, `extension`, `has_prefix`,
+  `prefix`.
+- **Invarianten:** `data` zeigt in den übergebenen Puffer und ist nur während
+  dessen Lebensdauer gültig; unbekannte Formate werden als `unknown`/`bin`
+  markiert, ohne die Aufnahme zu verändern.
+- **Threading:** Reine Funktion ohne eigenen Zustand, vom JSON-Worker benutzt.
 
 #### `Schema` (`prp::Schema`)
 
@@ -677,6 +716,28 @@ Reconnect, Fortschrittsformatierung und Netzwerk bleiben in
   damit der reguläre Client-Close zuerst abschließt. Große Pausen und fehlende
   Chunks erzeugen Warnungen, ändern das Timing aber nicht.
 - **Threading:** Alle Zustandsänderungen erfolgen auf dem Runner-Strand.
+
+#### `ReplayTimeline` (`prp::ReplayTimeline`)
+
+- **Verantwortung:** Monotone Zeitachse aus den Wall-Clock-Zeitstempeln der
+  Records; skaliert Gaps mit `--speed` und begrenzt sie mit `--max-gap`.
+- **Wichtige Methoden:** `note()`, `target_ns()`, `resync()`, `pass_time()`;
+  `scaled_delay_ns()` ist als reine Funktion testbar.
+- **Invarianten:** Ein Record ohne Zeitstempel wird nie zur Baseline; nach
+  Rückstau und beim Dispatch wird die Achse auf „jetzt“ gesetzt, damit kein
+  Burst entsteht. Große Pausen werden einmal beziehungsweise bei deutlicher
+  Vergrößerung gewarnt.
+- **Threading:** Wird nur vom Runner-Strand benutzt.
+
+#### `ProgressReporter` (`prp::ProgressReporter`)
+
+- **Verantwortung:** Modus-Auflösung von `--progress`, Drosselung und Ausgabe
+  der Fortschrittszeile inklusive `[i/N]` bei mehreren Chunks.
+- **Wichtige Methoden:** `begin()`, `update()`, `finish()`, `clear()`.
+- **Invarianten:** Der erste und letzte Update sind ungedrosselt; ohne Terminal
+  werden vollständige, mit `\n` abgeschlossene Zeilen geschrieben.
+- **Threading:** Wird nur vom Runner-Strand benutzt; die eigentliche Ausgabe
+  läuft über die thread-sicheren `prp::set_progress_line()`-Funktionen.
 
 #### `ClientConnection` (`prp::ClientConnection`)
 
@@ -753,6 +814,11 @@ classDiagram
     +on_read()
     +do_close(reason)
   }
+  class SessionLifecycle {
+    +begin_close()
+    +pause_reads()
+    +finalize()
+  }
   class Recorder {
     <<protorecrep>>
     +Recorder(RecorderConfig, ILogger*)
@@ -775,6 +841,11 @@ classDiagram
     +submit(item, segment)
     +stats()
   }
+  class BlobInfo {
+    <<value>>
+    +kind
+    +extension
+  }
   class FrameValidator {
     +feed(data, n, err)
     +reset()
@@ -794,6 +865,15 @@ classDiagram
     +start()
     +request_stop(signal)
     +exit_code()
+  }
+  class ReplayTimeline {
+    +note(ts, speed, max_gap, path)
+    +target_ns()
+  }
+  class ProgressReporter {
+    +begin(...)
+    +update(...)
+    +finish(...)
   }
   class CaptureReader {
     <<protorecrep>>
@@ -816,6 +896,7 @@ classDiagram
   }
 
   Server "1" --> "*" Session : verwaltet
+  Session --> SessionLifecycle : Zustand
   Server --> Recorder : schreibt
   Recorder --> RecorderConfig
   Recorder --> ILogger : nutzt (optional)
@@ -826,7 +907,10 @@ classDiagram
   Recorder --> JsonWriter : ItemObserver (Segment)
   JsonWriter --> FrameReader
   JsonWriter --> Schema
+  JsonWriter --> BlobInfo : analysiert
   ReplayRunner --> CaptureReader
+  ReplayRunner --> ReplayTimeline : Pacing
+  ReplayRunner --> ProgressReporter : Ausgabe
   ReplayRunner --> ClientConnection
   SessionForwarder --> ClientConnection
 ```
@@ -1469,7 +1553,7 @@ erlaubt.
 
 | Test | Schwerpunkt |
 |------|-------------|
-| `unit` | Queue, CRC32C, Recorder/Reader inkl. `ILogger`-Zustellung, Options, Framing, Namenshelfer, JSON/Blob, Chunkrotation, Observer |
+| `unit` | Queue, CRC32C, Recorder/Reader inkl. `ILogger`-Zustellung, Options, Framing, Namenshelfer, JSON/Blob inkl. `analyze_blob()`, Chunkrotation, Observer, `ReplayTimeline`, `SessionLifecycle` |
 | `integration` | Record mit Varint, JSONL-Chunks, `segment`-Feld, Einzeldatei-Modus, Chunking |
 | `replay` | Byte-genaues Replay, Pacing, Richtungen, Fehlerfälle, synthetische Aufzeichnungslücken (Sekunden bis Stunden) |
 | `passthrough` | Beide Richtungen inkl. Aufzeichnung und JSON-Chunks |
@@ -1674,6 +1758,27 @@ Zusätzlich: reale Referenzdaten in `tests/events.jsonl`, Benchmark über
   abstrakte Config-Klassen (verworfen: unnötige Indirektion, einfache
   Datenstrukturen reichen), Netzwerk mit in die Bibliothek ziehen (verworfen:
   Boost.Asio wäre eine unnötige Abhängigkeit).
+
+### ADR-15: Kleine Zustands- und Verantwortungsobjekte in der App
+
+- **Kontext:** `Session`, `ClientConnection`, `ReplayRunner` und `JsonWriter`
+  steuern asynchrone Lebenszyklen. Ursprünglich waren diese Zustände als
+  mehrere booleane Flags über große Dateien verteilt; Pacing, Fortschritt und
+  Blob-Erkennung waren in den Orchestratoren eingebettet.
+- **Entscheidung:** `SessionLifecycle` bündelt die Verbindungszustände mit
+  expliziten Übergängen. `ReplayTimeline`, `ProgressReporter` und
+  `BlobInfo`/`analyze_blob()` übernehmen jeweils eine klar umrissene Aufgabe.
+  `CaptureItem::close_reason` und `CaptureRecord::close_reason` sind jetzt
+  `CloseReason` statt `uint8_t`.
+- **Folgen:** Unmögliche Kombinationen sind schwerer darstellbar, die
+  reinen Logiken sind ohne Sockets und Worker-Threads testbar, und die
+  Orchestratoren sind kleiner. Es gibt keine neuen Vererbungshierarchien,
+  keine DI-Framework-Abhängigkeit und keine Änderung an CLI, Wire-Protokoll
+  oder PCRP-Format.
+- **Alternativen:** Weitere Flag-Prüfungen an den Aufrufstellen (verworfen:
+  fehleranfällig), abstrakte Basisklassen pro Komponente (verworfen: hier gibt
+  es keine austauschbaren Implementierungen), vollständiger Umbau auf ein
+  `std::variant`-Domänenmodell (zurzeit nicht verhältnismäßig).
 
 ---
 

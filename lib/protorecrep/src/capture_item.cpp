@@ -48,7 +48,7 @@ ItemPtr make_data(uint32_t stream_id, Direction dir, int64_t ts_ns, std::vector<
 
 ItemPtr make_stream_close(uint32_t stream_id, CloseReason reason, int64_t ts_ns) {
   auto item = make_item(ItemKind::StreamClose, stream_id, Direction::In, ts_ns);
-  item->close_reason = static_cast<uint8_t>(reason);
+  item->close_reason = reason;
   return item;
 }
 

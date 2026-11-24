@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,10 +13,13 @@
 #include <vector>
 
 #include "prp/cli/options.h"
+#include "prp/json/blob.h"
 #include "prp/json/json_writer.h"
 #include "prp/lib.h"
 #include "prp/net/framer.h"
+#include "prp/net/session_lifecycle.h"
 #include "prp/proto/schema.h"
+#include "prp/replay/timeline.h"
 #include "prp/util/base64.h"
 
 namespace {
@@ -1073,7 +1077,7 @@ void test_capture_reader() {
           break;
         case prp::rec::RecordType::StreamClose:
           ++closed;
-          CHECK_EQ(record.close_reason, static_cast<uint8_t>(prp::CloseReason::PeerClosed));
+          CHECK_EQ(record.close_reason, prp::CloseReason::PeerClosed);
           break;
         case prp::rec::RecordType::Trailer:
           ++trailers;
@@ -1477,6 +1481,76 @@ void test_typed_json_writer(const char* proto_path) {
   std::filesystem::remove_all(dir);
 }
 
+void test_blob_analysis() {
+  const std::string pcap("\xd4\xc3\xb2\xa1\x00\x00\x00\x00", 8);
+  prp::BlobInfo blob = prp::analyze_blob(pcap);
+  CHECK_EQ(blob.kind, std::string("pcap"));
+  CHECK_EQ(blob.extension, std::string("pcap"));
+  CHECK(!blob.has_prefix);
+  CHECK_EQ(blob.data.size(), size_t{8});
+
+  const std::string wav = std::string("RIFF\x24\x00\x00\x00WAVEfmt ", 16);
+  blob = prp::analyze_blob(wav);
+  CHECK_EQ(blob.kind, std::string("wav"));
+  CHECK_EQ(blob.extension, std::string("wav"));
+
+  blob = prp::analyze_blob("hello\nworld");
+  CHECK_EQ(blob.kind, std::string("text"));
+  CHECK_EQ(blob.extension, std::string("txt"));
+
+  const std::string unknown("\x00\x01\x02\xff", 4);
+  blob = prp::analyze_blob(unknown);
+  CHECK_EQ(blob.kind, std::string("unknown"));
+  CHECK_EQ(blob.extension, std::string("bin"));
+
+  const std::string prefixed("\x01\x00\x00\x00"
+                             "hello", 9);
+  blob = prp::analyze_blob(prefixed);
+  CHECK(blob.has_prefix);
+  CHECK_EQ(blob.prefix, 1u);
+  CHECK_EQ(std::string(blob.data), std::string("hello"));
+  CHECK_EQ(blob.kind, std::string("text"));
+}
+
+void test_replay_timeline() {
+  using namespace std::chrono;
+  CHECK_EQ(prp::scaled_delay_ns(2'000'000'000, 2.0, milliseconds{0}), 1'000'000'000);
+  CHECK_EQ(prp::scaled_delay_ns(2'000'000'000, 1.0, milliseconds{100}), 100'000'000);
+  CHECK_EQ(prp::scaled_delay_ns(-5, 1.0, milliseconds{0}), 0);
+  CHECK_EQ(prp::scaled_delay_ns(1'000, 0.0, milliseconds{0}), 0);
+
+  prp::ReplayTimeline timeline;
+  timeline.note(0, 0.0, milliseconds{0}, {});
+  timeline.note(1'000'000, 0.0, milliseconds{0}, {});  // establishes the baseline late
+  const int64_t now = prp::now_monotonic_ns();
+  timeline.resync(now + 1'000'000);
+  CHECK(timeline.target_ns() >= now + 1'000'000);
+  timeline.pass_time(now + 2'000'000);
+  CHECK_EQ(timeline.target_ns(), now + 2'000'000);
+  timeline.pass_time(now + 1'000'000);
+  CHECK_EQ(timeline.target_ns(), now + 2'000'000);  // time never moves backwards
+}
+
+void test_session_lifecycle() {
+  prp::SessionLifecycle life;
+  CHECK(!life.started());
+  CHECK(!life.closing());
+  life.mark_started();
+  CHECK(life.started());
+  CHECK(life.pause_reads());
+  CHECK(life.paused());
+  CHECK(!life.pause_reads());  // already paused
+  CHECK(life.begin_close());
+  CHECK(life.closing());
+  CHECK(!life.begin_close());  // close is idempotent
+  CHECK(!life.pause_reads());
+  life.resume_reads();
+  CHECK(!life.paused());
+  CHECK(life.finalize());
+  CHECK(life.finalized());
+  CHECK(!life.finalize());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1503,6 +1577,9 @@ int main(int argc, char** argv) {
   test_config_file();
   test_framer();
   test_item_queue();
+  test_blob_analysis();
+  test_replay_timeline();
+  test_session_lifecycle();
   test_file_header();
   test_recorder_roundtrip();
   test_recorder_logger();

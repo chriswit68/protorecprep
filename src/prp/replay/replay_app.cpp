@@ -1,13 +1,9 @@
 #include "prp/replay/replay_app.h"
 
-#include <algorithm>
 #include <array>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <functional>
-#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -27,6 +23,8 @@
 #include "prp/lib.h"
 #include "prp/net/client.h"
 #include "prp/proto/schema.h"
+#include "prp/replay/progress_reporter.h"
+#include "prp/replay/timeline.h"
 #include "prp/util/log.h"
 
 namespace prp {
@@ -39,9 +37,6 @@ constexpr size_t kTotalHighWater = 64ull * 1024 * 1024;
 constexpr size_t kStreamQueueLimit = 256ull * 1024 * 1024;
 constexpr auto kBackpressureRetry = std::chrono::milliseconds(5);
 constexpr unsigned kMaxReconnects = 10;
-constexpr int64_t kProgressIntervalNs = 100'000'000;      // in-place refresh: at most every 100 ms
-constexpr int64_t kProgressLineIntervalNs = 1'000'000'000;  // line output: at most every 1 s
-constexpr int64_t kLargeGapWarnNs = 10'000'000'000;        // warn about waits >= 10 s
 
 bool selected_direction(const Options& options, Direction dir) {
   switch (options.replay_direction) {
@@ -50,26 +45,6 @@ bool selected_direction(const Options& options, Direction dir) {
     case ReplayDirection::Both: return true;
   }
   return false;
-}
-
-std::string format_delay(int64_t ns) {
-  int64_t seconds = ns / 1'000'000'000;
-  if (seconds < 0) seconds = 0;
-  const int64_t hours = seconds / 3600;
-  seconds %= 3600;
-  const int64_t minutes = seconds / 60;
-  seconds %= 60;
-  char buf[64];
-  if (hours > 0) {
-    std::snprintf(buf, sizeof(buf), "%lldh %lldm %llds", static_cast<long long>(hours),
-                  static_cast<long long>(minutes), static_cast<long long>(seconds));
-  } else if (minutes > 0) {
-    std::snprintf(buf, sizeof(buf), "%lldm %llds", static_cast<long long>(minutes),
-                  static_cast<long long>(seconds));
-  } else {
-    std::snprintf(buf, sizeof(buf), "%llds", static_cast<long long>(seconds));
-  }
-  return buf;
 }
 
 // Only well-formed capture-NNNNNN.pcr names take part in the continuity check.
@@ -97,20 +72,6 @@ std::string direction_name(ReplayDirection dir) {
   return "unknown";
 }
 
-int64_t scaled_delay_ns(int64_t gap_ns, const Options& options) {
-  if (gap_ns <= 0 || options.replay_speed <= 0.0) return 0;
-  const double scaled = static_cast<double>(gap_ns) / options.replay_speed;
-  double capped = scaled;
-  if (options.max_gap.count() > 0) {
-    const double cap = static_cast<double>(options.max_gap.count()) * 1'000'000.0;
-    if (capped > cap) capped = cap;
-  }
-  const double kMax = static_cast<double>(std::numeric_limits<int64_t>::max() / 2);
-  if (!std::isfinite(capped) || capped >= kMax) return static_cast<int64_t>(kMax);
-  if (capped <= 0.0) return 0;
-  return static_cast<int64_t>(capped);
-}
-
 class ReplayRunner {
  public:
   using Strand = asio::strand<asio::io_context::executor_type>;
@@ -121,7 +82,8 @@ class ReplayRunner {
         strand_(asio::make_strand(io)),
         timer_(strand_),
         watchdog_(strand_),
-        finish_(std::move(finish)) {}
+        finish_(std::move(finish)),
+        progress_(options.progress) {}
 
   ReplayRunner(const ReplayRunner&) = delete;
   ReplayRunner& operator=(const ReplayRunner&) = delete;
@@ -152,7 +114,6 @@ class ReplayRunner {
   void prepare() {
     if (completed_) return;
     started_ns_ = now_monotonic_ns();
-    configure_progress();
 
     if (!options_.proto_file.empty()) {
       if (!schema_.load(options_.proto_file, options_.proto_paths, failure_)) {
@@ -182,70 +143,6 @@ class ReplayRunner {
 
     if (!open_next_file()) return;
     load_next_record();
-  }
-
-  // Resolves --progress into the effective display mode. The default (Auto)
-  // keeps the in-place line on a terminal, but switches to complete log lines
-  // otherwise: Docker Compose and other log pipelines split output on '\n'
-  // only, so bare '\r' updates would stay invisible until a file finishes.
-  void configure_progress() {
-    switch (options_.progress) {
-      case ProgressMode::Off:
-        progress_enabled_ = false;
-        break;
-      case ProgressMode::Line:
-        progress_enabled_ = true;
-        inline_progress_ = false;
-        break;
-      case ProgressMode::Inline:
-        progress_enabled_ = true;
-        inline_progress_ = true;
-        break;
-      case ProgressMode::Auto:
-        progress_enabled_ = true;
-        inline_progress_ = progress_stderr_is_tty();
-        break;
-    }
-  }
-
-  std::string progress_prefix() const {
-    if (files_.size() <= 1) return {};
-    return "[" + std::to_string(file_index_ + 1) + "/" + std::to_string(files_.size()) + "] ";
-  }
-
-  // Refreshes the progress display for the current capture file.
-  // `force` bypasses the throttle (used for the first and last update).
-  void update_progress(bool force = false) {
-    if (!progress_enabled_ || !reader_.is_open()) return;
-    const uint64_t size = reader_.file_size();
-    unsigned percent = 100;
-    if (size > 0) {
-      const uint64_t consumed = std::min(reader_.bytes_consumed(), size);
-      percent = static_cast<unsigned>(consumed * 100 / size);
-      if (percent > 100) percent = 100;
-    }
-    const int64_t now = now_monotonic_ns();
-    if (!force) {
-      if (static_cast<int>(percent) == last_progress_percent_) return;
-      const int64_t interval = inline_progress_ ? kProgressIntervalNs : kProgressLineIntervalNs;
-      if (now - last_progress_ns_ < interval) return;
-    }
-    last_progress_percent_ = static_cast<int>(percent);
-    last_progress_ns_ = now;
-    char tail[16];
-    std::snprintf(tail, sizeof(tail), "%3u%%", percent);
-    set_progress_line(progress_prefix() + reader_.path().string() + " " + tail, inline_progress_);
-  }
-
-  void begin_progress() {
-    last_progress_percent_ = -1;
-    last_progress_ns_ = 0;
-    update_progress(true);
-  }
-
-  void finish_progress() {
-    if (reader_.is_open()) update_progress(true);
-    clear_progress_line();
   }
 
   bool open_next_file() {
@@ -303,7 +200,8 @@ class ReplayRunner {
 
       log_printf(LogLevel::Debug, "opened capture %s (%llu record(s) so far)",
                  path.string().c_str(), static_cast<unsigned long long>(records_read_));
-      begin_progress();
+      progress_.begin(reader_.bytes_consumed(), reader_.file_size(), reader_.path(), file_index_,
+                      files_.size());
       file_has_trailer_ = false;
       ++valid_files_;
       return true;
@@ -344,16 +242,18 @@ class ReplayRunner {
       const ReadStatus status = reader_.next(record, detail);
       if (status == ReadStatus::Record) {
         ++records_read_;
-        update_progress();
+        progress_.update(reader_.bytes_consumed(), reader_.file_size(), reader_.path(), file_index_,
+                         files_.size());
         if (record.type == rec::RecordType::Trailer) file_has_trailer_ = true;
         current_ = std::move(record);
         have_current_ = true;
-        compute_schedule();
+        timeline_.note(current_.ts_ns, options_.replay_speed, options_.max_gap, reader_.path());
         schedule_current();
         return;
       }
       if (status == ReadStatus::Eof) {
-        finish_progress();
+        progress_.finish(reader_.bytes_consumed(), reader_.file_size(), reader_.path(), file_index_,
+                         files_.size());
         const std::string path = reader_.path().string();
         if (!file_has_trailer_) {
           const std::string message =
@@ -372,7 +272,8 @@ class ReplayRunner {
         continue;
       }
 
-      finish_progress();
+      progress_.finish(reader_.bytes_consumed(), reader_.file_size(), reader_.path(), file_index_,
+                       files_.size());
       const std::string message =
           reader_.path().string() + ": damaged capture at record " +
           std::to_string(reader_.records_read()) + ": " + detail;
@@ -386,36 +287,6 @@ class ReplayRunner {
       ++file_index_;
       if (!open_next_file()) return;
     }
-  }
-
-  void compute_schedule() {
-    const int64_t now = now_monotonic_ns();
-    if (!have_timeline_) {
-      have_timeline_ = true;
-      timeline_ns_ = now;
-      // A record without a wall-clock timestamp must not become the baseline.
-      last_ts_ns_ = current_.ts_ns > 0 ? current_.ts_ns : 0;
-      return;
-    }
-    if (current_.ts_ns <= 0) return;  // no timestamp, no pacing
-    if (last_ts_ns_ <= 0) {
-      last_ts_ns_ = current_.ts_ns;  // establish the baseline late
-      return;
-    }
-    int64_t gap = current_.ts_ns - last_ts_ns_;
-    last_ts_ns_ = current_.ts_ns;
-    if (gap < 0) gap = 0;
-    const int64_t delay = scaled_delay_ns(gap, options_);
-    if (delay >= kLargeGapWarnNs && (!large_gap_warned_ || delay > warned_gap_ns_ * 2)) {
-      large_gap_warned_ = true;
-      warned_gap_ns_ = delay;
-      log_printf(LogLevel::Warn,
-                 "large recorded gap of %s before %s at speed=%s; the target may close an idle "
-                 "connection -- consider --max-gap",
-                 format_delay(delay).c_str(), reader_.path().string().c_str(),
-                 std::to_string(options_.replay_speed).c_str());
-    }
-    timeline_ns_ += delay;
   }
 
   bool backpressured() const {
@@ -437,14 +308,15 @@ class ReplayRunner {
     if (backpressured()) {
       // Do not read ahead while the network cannot keep up. Resync the
       // timeline afterwards so the backlog is not replayed as a burst.
-      timeline_ns_ = std::max(timeline_ns_, now_monotonic_ns());
+      timeline_.resync(now_monotonic_ns());
       arm_timer(kBackpressureRetry, [this] { schedule_current(); });
       return;
     }
 
     const int64_t now = now_monotonic_ns();
-    if (timeline_ns_ > now) {
-      arm_timer(std::chrono::nanoseconds(timeline_ns_ - now), [this] { dispatch_current(); });
+    const int64_t target = timeline_.target_ns();
+    if (target > now) {
+      arm_timer(std::chrono::nanoseconds(target - now), [this] { dispatch_current(); });
     } else {
       asio::post(strand_, [this] { dispatch_current(); });
     }
@@ -508,7 +380,7 @@ class ReplayRunner {
 
     // If we fell behind (backpressure, slow disk, timer jitter), start the
     // next gap from now instead of accumulating a growing burst.
-    if (now > timeline_ns_) timeline_ns_ = now;
+    timeline_.pass_time(now);
     have_current_ = false;
     current_ = CaptureRecord{};
     load_next_record();
@@ -638,7 +510,7 @@ class ReplayRunner {
 
   void complete(int code, std::string failure) {
     if (completed_) return;
-    clear_progress_line();
+    progress_.clear();
     completed_ = true;
     exit_code_ = code;
     if (!failure.empty() && failure_.empty()) failure_ = std::move(failure);
@@ -655,6 +527,8 @@ class ReplayRunner {
   asio::steady_timer timer_;
   asio::steady_timer watchdog_;
   FinishCallback finish_;
+  ProgressReporter progress_;
+  ReplayTimeline timeline_;
 
   Schema schema_;
   bool schema_loaded_ = false;
@@ -667,22 +541,12 @@ class ReplayRunner {
   bool file_has_trailer_ = false;
   bool have_chunk_index_ = false;
   uint32_t last_chunk_index_ = 0;
-  bool large_gap_warned_ = false;
-  int64_t warned_gap_ns_ = 0;
   bool have_session_ = false;
   std::array<uint8_t, 16> session_uuid_{};
   rec::Framing session_framing_ = rec::Framing::VarintLength;
 
   bool have_current_ = false;
   CaptureRecord current_;
-  bool have_timeline_ = false;
-  int64_t last_ts_ns_ = 0;
-  int64_t timeline_ns_ = 0;
-
-  int last_progress_percent_ = -1;
-  int64_t last_progress_ns_ = 0;
-  bool progress_enabled_ = true;
-  bool inline_progress_ = true;
 
   std::map<uint32_t, StreamMeta> streams_;
   std::map<uint32_t, std::shared_ptr<ClientConnection>> stream_clients_;

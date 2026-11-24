@@ -339,7 +339,7 @@ ReadStatus CaptureReader::next(CaptureRecord& out, std::string& detail) {
         return ReadStatus::Damaged;
       }
       out.stream_id = info.stream_id;
-      out.close_reason = static_cast<uint8_t>(info.reason);
+      out.close_reason = info.reason;
       out.ts_ns = info.ts_ns;
       break;
     }
